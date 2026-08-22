@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# ROS 2 & Build artifacts
+build/
+install/
+log/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# Temporary logs & images
+*.log
+/tmp/
+*.png
+*.jpg
+*.jpeg
