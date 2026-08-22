@@ -281,17 +281,16 @@ class YoloDetectorNode(Node):
         if not cands:
             return None
 
-        # NẾU NGƯỜI DÙNG ĐÃ CHỌN 1 ID CỤ THỂ (hoặc qua Click / Phím 1-9):
+        # Chế độ tự động khóa mục tiêu (Auto-track cho demo 1 người):
         if self.selected_target_id is not None:
             matched = [c for c in cands if c[0] == self.selected_target_id]
             if matched:
                 best = matched[0]
             else:
-                # Target đã chọn tạm thời bị khuất hoặc chưa thấy
                 return None
         else:
-            # NẾU CHƯA CHỌN AI: Drone đứng yên hover, không gửi lệnh tracking
-            return None
+            # Tự động chọn người rõ nhất và lớn nhất trong khung hình
+            best = max(cands, key=lambda c: c[6] * c[5])
 
         tid, x1, y1, x2, y2, cf, area = best
 
@@ -357,49 +356,35 @@ class YoloDetectorNode(Node):
         cv2.line(img, (zx2, zy2), (zx2, zy2 - bracket_len), z_color, 1)
         cv2.putText(img, "50% SAFE ZONE", (zx1 + 5, zy1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
 
-        # Draw all valid detected boxes with confidence and track ID
+        # Draw detected target box
         for cand in self.current_cands:
             tid, x1, y1, x2, y2, cf, area = cand
             x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            is_locked = (self.selected_target_id is not None and tid == self.selected_target_id)
-            color = (0, 255, 0) if is_locked else (255, 180, 0)  # Green for locked target, Cyan for candidate
+            is_target = (target is not None and (tid == target[0] or self.selected_target_id is None))
+            color = (0, 255, 0) if is_target else (255, 180, 0)
 
             # Bounding box
-            thickness = 3 if is_locked else 2
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
             # Label text
-            if is_locked:
-                label = f"LOCKED ID: {tid} ({cf*100:.0f}%)"
-            else:
-                label = f"[ID: {tid}] Click/Press {tid} ({cf*100:.0f}%)"
-
+            label = f"Person {cf*100:.0f}%"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
             label_y = max(th + 4, y1)
             cv2.rectangle(img, (x1, label_y - th - 4), (x1 + tw + 6, label_y + 2), color, -1)
             cv2.putText(img, label, (x1 + 3, label_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
         # Top-left status banner
-        if self.selected_target_id is not None:
-            if target is not None:
-                status_text = f"TRACKING TARGET [ID: {self.selected_target_id}]"
-                badge_color = (0, 200, 0)
-            else:
-                status_text = f"SEARCHING TARGET [ID: {self.selected_target_id}]..."
-                badge_color = (0, 140, 255)
+        if self.state == STATE_TRACKING:
+            status_text = "TRACKING TARGET (ACTIVE)"
+            badge_color = (0, 200, 0)
         else:
-            status_text = "STANDBY: CLICK PERSON OR PRESS [1-9] TO SELECT TARGET"
-            badge_color = (0, 220, 255)
+            status_text = "SEARCHING TARGET..."
+            badge_color = (0, 140, 255)
 
         (sw, sh), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(img, (10, 10), (20 + sw, 20 + sh + 6), (30, 30, 30), -1)
         cv2.rectangle(img, (10, 10), (20 + sw, 20 + sh + 6), badge_color, 2)
         cv2.putText(img, status_text, (15, 16 + sh), cv2.FONT_HERSHEY_SIMPLEX, 0.5, badge_color, 1, cv2.LINE_AA)
-
-        # Bottom help instruction bar
-        help_text = "Select: Click Box or Press 1/2 | Deselect/Hover: Press 0 or SPACE"
-        cv2.rectangle(img, (10, ih - 30), (iw - 10, ih - 8), (20, 20, 20), -1)
-        cv2.putText(img, help_text, (16, ih - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
         self.pub_debug.publish(self.bridge.cv2_to_imgmsg(img, 'bgr8'))
 

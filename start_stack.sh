@@ -9,7 +9,7 @@ export GZ_SIM_SYSTEM_PLUGIN_PATH=/home/tungt/ardupilot_gazebo/build:${GZ_SIM_SYS
 export GZ_SIM_RESOURCE_PATH=/home/tungt/ardupilot_gazebo/models:/home/tungt/ardupilot_gazebo/worlds:${GZ_SIM_RESOURCE_PATH:-}
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}
 
-WORLD_NAME="${WORLD_NAME:-person_tracking_fork}"
+WORLD_NAME="${WORLD_NAME:-person_tracking_no_trees}"
 WORLD_FILE="${WORLD_FILE:-/home/tungt/ardupilot_gazebo/worlds/${WORLD_NAME}.sdf}"
 echo "Sử dụng Gazebo World: ${WORLD_FILE}"
 CAMERA_TOPIC="${CAMERA_TOPIC:-/world/person_tracking_path/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image}"
