@@ -29,7 +29,8 @@ class VehicleYawSearch(Node):
         self.declare_parameter('deadband_x', 20.0)
         self.declare_parameter('deadband_y', 25.0)
         self.declare_parameter('max_forward_speed', 1.8)
-        self.declare_parameter('min_forward_speed', 0.0)
+        self.declare_parameter('min_forward_speed', -1.2)
+        self.declare_parameter('default_backup_speed', 0.75)
         self.declare_parameter('tree_clearance_margin', 1.8)
         gp = self.get_parameter
         self.kp = float(gp('kp').value)
@@ -40,6 +41,7 @@ class VehicleYawSearch(Node):
         self.takeoff_alt = float(gp('takeoff_alt').value)
         self.enable_forward = bool(gp('enable_forward').value)
         self.default_walk_speed = float(gp('default_walk_speed').value)
+        self.default_backup_speed = float(gp('default_backup_speed').value)
         self.kp_y_boost = float(gp('kp_y_boost').value)
         self.kp_lateral = float(gp('kp_lateral').value)
         self.deadband_x = float(gp('deadband_x').value)
@@ -284,8 +286,13 @@ class VehicleYawSearch(Node):
 
                 if self.enable_forward:
                     if error_y < -self.deadband_y:
+                        # Người ở nửa trên khung hình (xa hơn) -> Tiến tới theo người
                         boost = self.kp_y_boost * (-error_y - self.deadband_y)
                         vx = self.default_walk_speed + boost
+                    elif error_y > self.deadband_y:
+                        # Người ở góc dưới khung hình (quá gần / sắp trôi ra ngoài) -> LÙI VỀ PHÍA SAU!
+                        boost = self.kp_y_boost * (error_y - self.deadband_y)
+                        vx = -(self.default_backup_speed + boost)
                     else:
                         vx = 0.0
                 else:
@@ -303,26 +310,40 @@ class VehicleYawSearch(Node):
             vx = 0.0
             vy = 0.0
         else:
-            # Khi người đi khuất sau cây / rẽ khúc cua:
-            # Bay theo vector đường thẳng (dx, dy) tới đúng điểm rẽ trước khi xoay!
-            if self.dist_advanced < target_dist and age <= 10.0:
-                state = 'ADVANCING_TO_TURN_POINT'
-                speed = 1.35  # Tốc độ bay thẳng 1.35 m/s
-                vx = speed * (target_dx / target_dist)
-                vy = speed * (target_dy / target_dist)
-                yaw_rate = 0.0  # Khóa cứng 0.0, bay thẳng chính xác theo đường thẳng tới mục tiêu
-                self.dist_advanced += speed * dt
-            elif age <= 10.0:
-                # Đã bay tới đúng vị trí điểm rẽ -> Xoay Drone sang góc rẽ của người!
-                state = 'ROTATING_AT_TURN_POINT'
-                vx = 0.0
-                vy = 0.0
-                yaw_rate = self.target_turn_dir * 0.50  # ~28.6 deg/s xoay đón đầu góc rẽ
+            # Khi người bị che khuất hoặc rẽ:
+            if getattr(self, 'last_seen_y', 0.0) > self.deadband_y:
+                # Người vừa ở mép dưới: LÙI THẲNG VỀ PHÍA SAU, TUYỆT ĐỐI KHÔNG XOAY TRÒN 360!
+                if age <= 4.0:
+                    state = 'BACKING_UP_TO_RECOVER'
+                    vx = -0.85  # Lùi lại mở rộng tầm nhìn về phía trước
+                    vy = 0.0
+                    yaw_rate = 0.0  # Khóa cứng góc xoay 0.0, không xoay vòng
+                else:
+                    state = 'SEARCHING'
+                    yaw_rate = self.direction * self.search_rate
+                    vx = 0.0
+                    vy = 0.0
             else:
-                state = 'SEARCHING'
-                yaw_rate = self.direction * self.search_rate
-                vx = 0.0
-                vy = 0.0
+                # Người rẽ sang trái/phải hoặc đi khuất sau khúc cua:
+                # GIAI ĐOẠN 1: Bay theo vector đường thẳng (dx, dy) tới đúng điểm rẽ trước khi xoay!
+                if self.dist_advanced < target_dist and age <= 10.0:
+                    state = 'ADVANCING_TO_TURN_POINT'
+                    speed = 1.35  # Tốc độ bay thẳng 1.35 m/s
+                    vx = speed * (target_dx / target_dist)
+                    vy = speed * (target_dy / target_dist)
+                    yaw_rate = 0.0  # Khóa cứng 0.0, bay thẳng chính xác theo đường thẳng tới mục tiêu
+                    self.dist_advanced += speed * dt
+                elif age <= 10.0:
+                    # GIAI ĐOẠN 2: Đã bay tới đúng vị trí điểm rẽ -> Xoay Drone sang góc rẽ của người!
+                    state = 'ROTATING_AT_TURN_POINT'
+                    vx = 0.0
+                    vy = 0.0
+                    yaw_rate = self.target_turn_dir * 0.50  # ~28.6 deg/s xoay đón đầu góc rẽ
+                else:
+                    state = 'SEARCHING'
+                    yaw_rate = self.direction * self.search_rate
+                    vx = 0.0
+                    vy = 0.0
 
         yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
 
