@@ -1,28 +1,33 @@
 # 🚁 Autonomous Drone Vision Tracking System
 
-Hệ thống điều khiển Drone tự động nhận diện và bám đuổi người đi bộ theo thời gian thực (Vision-based Person Following Drone) kết hợp **ArduPilot SITL**, **Gazebo Harmonic**, **ROS 2 Humble**, **YOLOv8** và **ByteTrack**.
+Hệ thống điều khiển Drone tự động nhận diện, khóa mục tiêu tùy chọn và bám đuổi người đi bộ theo thời gian thực (Interactive Multi-Person Following Drone) kết hợp **ArduPilot SITL**, **Gazebo Harmonic**, **ROS 2 Humble**, **YOLOv8** và **ByteTrack**.
 
 ---
 
 ## 📋 Mục Lục
-1. [Giới Thiệu & Tính Năng](#-giới-thiệu--tính-năng)
+1. [Giới Thiệu & Tính Năng Nổi Bật](#-giới-thiệu--tính-năng-nổi-bật)
 2. [Cấu Trúc Thư Mục & Vai Trò Từng File](#-cấu-trúc-thư-mục--vai-trò-từng-file)
 3. [Yêu Cầu Hệ Thống & Hướng Dẫn Cài Đặt](#-yêu-cầu-hệ-thống--hướng-dẫn-cài-đặt)
-4. [Hướng Dẫn Chạy Dự Án](#-hướng-dẫn-chạy-dự-án)
+4. [Hướng Dẫn Chạy Dự Án & Chọn Mục Tiêu](#-hướng-dẫn-chạy-dự-án--chọn-mục-tiêu)
 5. [Nguyên Lý Hoạt Động Cốt Lõi](#-nguyên-lý-hoạt-động-cốt-lõi)
 
 ---
 
-## 🌟 Giới Thiệu & Tính Năng
+## 🌟 Giới Thiệu & Tính Năng Nổi Bật
 
-- **AI Vision Detection & Tracking**: Sử dụng mô hình **YOLOv8s** và **ByteTrack** để nhận diện và theo dõi đối tượng người đi bộ theo thời gian thực với độ chính xác cao.
-- **50% Safe Zone Deadband**: Giữ tâm mục tiêu trong vùng an toàn 50% khung hình giúp Drone bay êm ái, loại bỏ hiện tượng giật lắc và dao động liên tục.
-- **Fixed Gimbal / Airframe Tracking**: Khóa góc camera chúc $37^\circ$ (`0.65 rad`), Drone tự động điều hướng xoay thân (`yaw_rate`) và tiến/lùi (`vx`, `vy`) bám sát người.
-- **Thuật toán Hình học 3D Pinhole & Vượt Tán Cây (Tree Clearance)**:
-  - Tính toán khoảng cách mặt đất thực tế $d_x, d_y$ từ camera tới người dựa trên ma trận quang học Pinhole và độ cao bay.
+- **🎯 Multi-Person Target Selection (Khóa mục tiêu người tùy chọn)**:
+  - Khi có nhiều người trong khung hình, hệ thống gán nhãn `[ID: 1]`, `[ID: 2]`... cho từng người.
+  - **Tương tác trực tiếp qua Live HUD**: Người dùng có thể **Click chuột trực tiếp** vào ô của người muốn bám đuổi, hoặc **bấm phím số `1`, `2`, `3`...** trên bàn phím.
+  - **Chế độ Standby / Hover**: Nếu chưa chọn ai (hoặc bấm `0` / `SPACE`), Drone sẽ **đứng yên bay tại chỗ (Hover)**, không bám lung tung.
+- **⚡ 60s Standstill & 2 Branching Paths World (`person_tracking_fork.sdf`)**:
+  - 2 người đứng yên trong **60 giây đầu** để người dùng quan sát và chọn mục tiêu.
+  - Sau 60s, Người 1 rẽ nhánh **Bắc (Trái)**, Người 2 rẽ nhánh **Nam (Phải)**. Drone sẽ bám sát đúng người đã chọn!
+- **📐 Thuật toán Hình học 3D Pinhole & Vượt Tán Cây (Tree Clearance)**:
+  - Tính toán khoảng cách mặt đất thực tế $d_x, d_y$ từ camera tới người:
+    $$d_x = \frac{h_{\text{rel}}}{\tan(\theta_{\text{pitch}} + \alpha_y)}, \quad d_y = d_x \cdot \frac{e_x}{f_x}$$
   - Tự động cộng thêm khoảng đệm an toàn $+1.8\text{m}$ (`tree_clearance_margin`) khi người rẽ/đi khuất sau cây để Drone bay thẳng vượt qua tán lá trước khi xoay hướng tại khúc cua.
-- **Hiển Thị Vùng Thu Camera (FOV Ray Frustum)**: 4 tia laser phát sáng màu xanh Cyan định vị vùng nhìn của camera xuống mặt đất trong cửa sổ 3D Gazebo (ẩn trên luồng camera thực bằng `visibility_mask`).
-- **Live Camera HUD**: Cửa sổ trực quan hiển thị hình ảnh từ Camera, khung Safe Zone, Bounding Box đối tượng, tâm ngắm và thông số bay thời gian thực.
+- **🛡️ 50% Safe Zone Deadband**: Giữ tâm mục tiêu trong vùng an toàn 50% khung hình giúp Drone bay êm ái, loại bỏ hoàn toàn hiện tượng rung lắc.
+- **✨ Hiển Thị Vùng Thu Camera (FOV Ray Frustum)**: 4 tia laser phát sáng màu xanh Cyan định vị vùng nhìn của camera xuống mặt đất trong cửa sổ 3D Gazebo (tự động ẩn trên camera thực tế bằng `visibility_mask`).
 
 ---
 
@@ -30,11 +35,11 @@ Hệ thống điều khiển Drone tự động nhận diện và bám đuổi n
 
 ```text
 drone-project/
-├── README.md                      # Tài liệu hướng dẫn cài đặt và sử dụng dự án
+├── README.md                      # Tài liệu hướng dẫn cài đặt, sử dụng và nguyên lý
 ├── .gitignore                     # Cấu hình bỏ qua file build, cache, log khi push git
-├── start_stack.sh                 # Script Bash khởi động toàn bộ pipeline (SITL, Gazebo, ROS 2, YOLO, Control, HUD)
+├── start_stack.sh                 # Script Bash 1-Click khởi động toàn bộ pipeline
 ├── vehicle_yaw_search.py          # Node điều khiển Drone: bay bám đuổi, tính khoảng cách 3D và vượt tán cây
-├── live_camera_hud.py             # Node hiển thị cửa sổ Camera HUD trực tiếp với Safe Zone 50%
+├── live_camera_hud.py             # Node hiển thị Live Camera HUD (Click chuột / Phím chọn mục tiêu)
 ├── flight_teleop.py               # Tiện ích điều khiển Drone thủ công qua bàn phím (WASD / MAVLink)
 │
 ├── ros2_ws/                       # Không gian làm việc ROS 2
@@ -43,13 +48,14 @@ drone-project/
 │           ├── package.xml        # Định nghĩa thông tin package & dependencies ROS 2
 │           ├── setup.py           # File cài đặt và đăng ký executable node
 │           └── vision_tracking/
-│               ├── yolo_detector_node.py   # Node YOLOv8 + ByteTrack phát hiện người và tính sai số bám đuổi
-│               ├── gimbal_controller_node.py # Node điều khiển Gimbal độc lập (khi dùng chế độ Gimbal Search)
+│               ├── yolo_detector_node.py   # Node YOLOv8 + ByteTrack: phát hiện, gán ID và chọn mục tiêu
+│               ├── gimbal_controller_node.py # Node điều khiển Gimbal độc lập
 │               └── tracking_eval.py        # Module đánh giá độ trễ và hiệu năng bám đuổi
 │
 ├── gazebo/                        # Tài nguyên mô phỏng Gazebo
 │   ├── worlds/
-│   │   ├── person_tracking_no_trees.sdf # World công viên thoáng không có cây (Mặc định)
+│   │   ├── person_tracking_fork.sdf     # World ngã ba 2 nhánh: 2 người đứng 60s rồi rẽ 2 hướng (Mặc định)
+│   │   ├── person_tracking_no_trees.sdf # World công viên thoáng 1 người không có cây
 │   │   └── person_tracking_path.sdf     # World công viên có hàng cây sồi/thông để test vượt tán cây
 │   ├── models/
 │   │   ├── gimbal_small_3d/       # Model Gimbal 3D tích hợp Camera và 4 tia laser FOV Frustum
@@ -137,29 +143,29 @@ source install/setup.bash
 
 ---
 
-## 🚀 Hướng Dẫn Chạy Dự Án
+## 🚀 Hướng Dẫn Chạy Dự Án & Chọn Mục Tiêu
 
-Chỉ cần chạy **1 lệnh duy nhất** để khởi động toàn bộ hệ thống mô phỏng và bám đuổi:
-
-### 1. Chạy trong môi trường Open Field (Không có cây - Mặc định):
+### 1. Khởi động hệ thống (Chế độ 2 người rẽ 2 hướng sau 60s - Mặc định):
 ```bash
 cd ~/drone-project
 chmod +x start_stack.sh
 ./start_stack.sh
 ```
 
-### 2. Chạy trong môi trường công viên có cây (Kiểm tra thuật toán né/vượt tán cây):
-```bash
-cd ~/drone-project
-WORLD_NAME=person_tracking_path ./start_stack.sh
-```
+### 2. Cách chọn mục tiêu trong cửa sổ Live Camera HUD:
+- **Cách 1 (Click chuột)**: Click chuột trái trực tiếp vào ô người muốn theo dõi trên cửa sổ Camera HUD.
+- **Cách 2 (Phím số)**: Nhấn phím số `1` để khóa Người 1 (đi nhánh Bắc), nhấn `2` để khóa Người 2 (đi nhánh Nam).
+- **Hủy chọn / Đứng yên (Hover)**: Nhấn phím `0` hoặc phím cách `SPACE`.
 
-### 3. Điều khiển thủ công bằng bàn phím (Tùy chọn):
-Nếu muốn tự lái Drone thủ công trong khi camera vẫn tracking:
-```bash
-python3 ~/drone-project/flight_teleop.py
-```
-*(Các phím: `W/S` - Tiến/Lùi, `A/D` - Trái/Phải, `Up/Down` - Lên/Xuống, `Left/Right` - Xoay Yaw)*
+### 3. Chạy các môi trường khác:
+- **World công viên có cây (Né / Vượt tán cây)**:
+  ```bash
+  WORLD_NAME=person_tracking_path ./start_stack.sh
+  ```
+- **World công viên thoáng 1 người (Không cây)**:
+  ```bash
+  WORLD_NAME=person_tracking_no_trees ./start_stack.sh
+  ```
 
 ---
 
@@ -168,12 +174,9 @@ python3 ~/drone-project/flight_teleop.py
 1. **Khởi động & Cất cánh tự động**:
    - `start_stack.sh` khởi tạo ArduPilot SITL và Gazebo Harmonic.
    - Drone tự động chuyển sang chế độ `GUIDED`, Arm động cơ và cất cánh lên độ cao $3.8\text{m}$.
-2. **Nhận diện & Bám đuổi (Tracking Mode)**:
-   - Camera trên Drone truyền hình ảnh về topic ROS 2 `/tracking/image_raw`.
-   - `yolo_detector_node` phát hiện người đi bộ, chạy ByteTrack và tính sai số pixel $(e_x, e_y)$ so với tâm khung hình.
-   - `vehicle_yaw_search.py` áp dụng vùng đệm 50% Safe Zone để Drone bay êm ái, bám theo tốc độ đi bộ của người.
-3. **Tính toán vị trí 3D & Vượt tán cây (Turn & Obstacle Clearance)**:
-   - Khoảng cách mặt đất thực tế được tính toán theo thời gian thực:
-     $$d_x = \frac{h_{\text{rel}}}{\tan(\theta_{\text{pitch}} + \alpha_y)}, \quad d_y = d_x \cdot \frac{e_x}{f_x}$$
-   - Khi người đi khuất sau khúc cua/tán cây, Drone chuyển sang trạng thái `ADVANCING_TO_TURN_POINT`, khóa cứng $\text{yaw\_rate} = 0.0^\circ\text{/s}$ và bay thẳng quãng đường $(d_x + 1.8\text{m})$ để vượt hẳn qua mép tán lá.
-   - Khi đã đến vùng thoáng tại điểm rẽ, Drone chuyển sang `ROTATING_AT_TURN_POINT` xoay thân đón đầu người ở góc cua mới.
+2. **Liệt kê Candidate & Chờ Người Dùng Chọn**:
+   - `yolo_detector_node` phát hiện tất cả người trong khung hình, hiển thị khung màu xanh Cyan `[ID: 1]`, `[ID: 2]`.
+   - Nếu chưa chọn ai, Drone giữ trạng thái `STANDBY / HOVER` bay tại chỗ an toàn.
+3. **Khóa Mục Tiêu & Bám Đuổi (Target Locking & Tracking)**:
+   - Khi người dùng click chọn ID $K$, mục tiêu chuyển sang khung màu **Xanh Lá `LOCKED ID: K`**.
+   - `vehicle_yaw_search.py` nhận sai số của đúng đối tượng $K$ và điều khiển Drone bám sát theo người đó khi người bắt đầu di chuyển sau 60s.

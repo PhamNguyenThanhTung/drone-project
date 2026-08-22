@@ -25,6 +25,7 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point
+from std_msgs.msg import Int32
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
@@ -47,10 +48,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('img_width', 416)
         self.declare_parameter('img_height', 416)
-        # inference resolution: True -> feed the native camera frame to YOLO,
-        # False -> pre-resize to img_width x img_height first
         self.declare_parameter('infer_native', True)
-        # 0 -> derive from the frame actually fed to YOLO
         self.declare_parameter('infer_imgsz', 0)
         self.declare_parameter('conf', 0.50)
         self.declare_parameter('iou', 0.45)
@@ -63,6 +61,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('show_debug_image', False)
         self.declare_parameter('target_timeout', 4.0)
         self.declare_parameter('log_period', 1.0)
+        self.declare_parameter('default_target_id', -1)
 
         gp = self.get_parameter
         self.image_topic = gp('image_topic').value
@@ -83,6 +82,8 @@ class YoloDetectorNode(Node):
         self.show_debug_image = bool(gp('show_debug_image').value)
         self.target_timeout = float(gp('target_timeout').value)
         self.log_period = float(gp('log_period').value)
+        default_id = int(gp('default_target_id').value)
+        self.selected_target_id = default_id if default_id >= 0 else None
 
         self.bridge = CvBridge()
         self.get_logger().info(
@@ -94,6 +95,9 @@ class YoloDetectorNode(Node):
         if self.show_debug_image:
             self.pub_debug = self.create_publisher(Image, gp('debug_image_topic').value, 2)
 
+        self.sub_select = self.create_subscription(Int32, '/tracking/select_target', self.on_select_target, 10)
+        self.sub_click = self.create_subscription(Point, '/tracking/click_point', self.on_click_point, 10)
+
         qos = QoSProfile(depth=2,
                          reliability=ReliabilityPolicy.RELIABLE,
                          history=HistoryPolicy.KEEP_LAST)
@@ -104,7 +108,7 @@ class YoloDetectorNode(Node):
         self.target_id = None
         self.last_seen = 0.0
         self.logged_source_size = None
-        # inference -> error-frame scale, refreshed on every frame
+        self.current_cands = []
         self.sx = 1.0
         self.sy = 1.0
 
@@ -197,9 +201,49 @@ class YoloDetectorNode(Node):
 
         self.log_metrics()
 
+    def on_select_target(self, msg):
+        req_id = int(msg.data)
+        if req_id < 0:
+            self.get_logger().info('[YOLO] Target selection CLEARED -> Drone STANDBY / HOVER')
+            self.selected_target_id = None
+            self.target_id = None
+            self.state = STATE_LOST
+        else:
+            self.get_logger().info(f'[YOLO] Target LOCKED to Person ID: {req_id}')
+            self.selected_target_id = req_id
+            self.target_id = req_id
+
+    def on_click_point(self, msg):
+        cx = float(msg.x)
+        cy = float(msg.y)
+        if not self.current_cands:
+            return
+        matched_id = None
+        min_d2 = 999999.0
+        for tid, x1, y1, x2, y2, cf, area in self.current_cands:
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                matched_id = tid
+                break
+            bx, by = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            d2 = (bx - cx)**2 + (by - cy)**2
+            if d2 < min_d2 and d2 < (120.0**2):
+                min_d2 = d2
+                matched_id = tid
+
+        if matched_id is not None:
+            self.get_logger().info(f'[YOLO] User clicked on Person ID: {matched_id} -> LOCKED')
+            self.selected_target_id = matched_id
+            self.target_id = matched_id
+        else:
+            self.get_logger().info('[YOLO] Clicked empty area -> CLEARED (STANDBY)')
+            self.selected_target_id = None
+            self.target_id = None
+            self.state = STATE_LOST
+
     # ------------------------------------------------------------------
     def select_target(self, results):
         """Return (track_id, xmin, ymin, xmax, ymax, conf) for the chosen person."""
+        self.current_cands = []
         if not results:
             return None
         boxes = results[0].boxes
@@ -224,40 +268,30 @@ class YoloDetectorNode(Node):
             area = w * h
             aspect_ratio = h / w
 
-            # Reject boxes touching the very bottom edge, which are usually the
-            # drone body/shadow in this downward-looking camera.
             if y2 > bottom_limit:
                 continue
-
-            # Filter by area ratio
             if area < min_area or area > max_area:
                 continue
-
-            # Filter by aspect ratio (reject flat horizontal shadows)
             if aspect_ratio < self.min_aspect_ratio or aspect_ratio > self.max_aspect_ratio:
                 continue
 
             cands.append((tid, x1, y1, x2, y2, cf, area))
+
+        self.current_cands = cands
         if not cands:
             return None
 
-        # 1) If previous target position is known, extrapolate with velocity for tree occlusion
-        if hasattr(self, 'last_target_pos') and self.last_target_pos is not None:
-            dt = time.time() - getattr(self, 'last_target_time', time.time())
-            dt = min(3.5, max(0.0, dt))
-            vx, vy = getattr(self, 'target_vel', (0.0, 0.0))
-            pred_px = self.last_target_pos[0] + vx * dt
-            pred_py = self.last_target_pos[1] + vy * dt
-
-            best = min(
-                cands,
-                key=lambda c: (
-                    (((c[1] + c[3]) / 2.0) - pred_px) ** 2
-                    + (((c[2] + c[4]) / 2.0) - pred_py) ** 2),
-            )
+        # NẾU NGƯỜI DÙNG ĐÃ CHỌN 1 ID CỤ THỂ (hoặc qua Click / Phím 1-9):
+        if self.selected_target_id is not None:
+            matched = [c for c in cands if c[0] == self.selected_target_id]
+            if matched:
+                best = matched[0]
+            else:
+                # Target đã chọn tạm thời bị khuất hoặc chưa thấy
+                return None
         else:
-            # Otherwise choose candidate with largest area / highest confidence
-            best = max(cands, key=lambda c: c[6] * c[5])
+            # NẾU CHƯA CHỌN AI: Drone đứng yên hover, không gửi lệnh tracking
+            return None
 
         tid, x1, y1, x2, y2, cf, area = best
 
@@ -286,7 +320,7 @@ class YoloDetectorNode(Node):
 
         self.last_target_pos = new_pos
         self.last_target_time = cur_time
-        self.target_id = 0  # Keep unified primary track ID for the person
+        self.target_id = tid
 
         return (self.target_id, self.smooth_box[0], self.smooth_box[1],
                 self.smooth_box[2], self.smooth_box[3], cf)
@@ -294,7 +328,6 @@ class YoloDetectorNode(Node):
     # ------------------------------------------------------------------
     def publish_error(self, target):
         _tid, x1, y1, x2, y2, _cf = target
-        # map the bbox from inference coordinates into the 416x416 error frame
         x1, x2 = x1 * self.sx, x2 * self.sx
         y1, y2 = y1 * self.sy, y2 * self.sy
         cx, cy = self.W / 2.0, self.H / 2.0
@@ -309,60 +342,64 @@ class YoloDetectorNode(Node):
         img = frame.copy()
         ih, iw = img.shape[:2]
 
-        # Draw 50% active tracking safe zone box (25% margin on all 4 sides)
+        # Draw 50% active tracking safe zone box
         zx1, zx2 = int(0.25 * iw), int(0.75 * iw)
         zy1, zy2 = int(0.25 * ih), int(0.75 * ih)
-        # Draw subtle corner brackets for the 50% zone
         z_color = (0, 255, 255)
         bracket_len = 25
-        # Top-left
         cv2.line(img, (zx1, zy1), (zx1 + bracket_len, zy1), z_color, 1)
         cv2.line(img, (zx1, zy1), (zx1, zy1 + bracket_len), z_color, 1)
-        # Top-right
         cv2.line(img, (zx2, zy1), (zx2 - bracket_len, zy1), z_color, 1)
         cv2.line(img, (zx2, zy1), (zx2, zy1 + bracket_len), z_color, 1)
-        # Bottom-left
         cv2.line(img, (zx1, zy2), (zx1 + bracket_len, zy2), z_color, 1)
         cv2.line(img, (zx1, zy2), (zx1, zy2 - bracket_len), z_color, 1)
-        # Bottom-right
         cv2.line(img, (zx2, zy2), (zx2 - bracket_len, zy2), z_color, 1)
         cv2.line(img, (zx2, zy2), (zx2, zy2 - bracket_len), z_color, 1)
         cv2.putText(img, "50% SAFE ZONE", (zx1 + 5, zy1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
 
         # Draw all valid detected boxes with confidence and track ID
-        boxes = results[0].boxes if results else None
-        if boxes is not None and len(boxes) > 0:
-            ids = boxes.id.int().tolist() if boxes.id is not None else list(range(len(boxes)))
-            xyxy = boxes.xyxy.tolist()
-            confs = boxes.conf.tolist()
-            for tid, box, cf in zip(ids, xyxy, confs):
-                x1, y1, x2, y2 = [int(v) for v in box]
-                is_target = (target is not None and tid == target[0])
-                color = (0, 255, 0) if is_target else (255, 180, 0)  # Bright Green for target, Cyan for candidate
+        for cand in self.current_cands:
+            tid, x1, y1, x2, y2, cf, area = cand
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            is_locked = (self.selected_target_id is not None and tid == self.selected_target_id)
+            color = (0, 255, 0) if is_locked else (255, 180, 0)  # Green for locked target, Cyan for candidate
 
-                # Bounding box
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            # Bounding box
+            thickness = 3 if is_locked else 2
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
 
-                # Label text: Person + Conf% + ID
-                label = f"Person {cf*100:.0f}% (ID:{tid})"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                label_y = max(th + 4, y1)
-                # Label background header
-                cv2.rectangle(img, (x1, label_y - th - 4), (x1 + tw + 6, label_y + 2), color, -1)
-                cv2.putText(img, label, (x1 + 3, label_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+            # Label text
+            if is_locked:
+                label = f"LOCKED ID: {tid} ({cf*100:.0f}%)"
+            else:
+                label = f"[ID: {tid}] Click/Press {tid} ({cf*100:.0f}%)"
 
-        # Clean status banner at top-left
-        if self.state == STATE_TRACKING:
-            status_text = f"TRACKING (Target ID: {self.target_id})"
-            badge_color = (0, 200, 0)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            label_y = max(th + 4, y1)
+            cv2.rectangle(img, (x1, label_y - th - 4), (x1 + tw + 6, label_y + 2), color, -1)
+            cv2.putText(img, label, (x1 + 3, label_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # Top-left status banner
+        if self.selected_target_id is not None:
+            if target is not None:
+                status_text = f"TRACKING TARGET [ID: {self.selected_target_id}]"
+                badge_color = (0, 200, 0)
+            else:
+                status_text = f"SEARCHING TARGET [ID: {self.selected_target_id}]..."
+                badge_color = (0, 140, 255)
         else:
-            status_text = "SEARCHING TARGET..."
-            badge_color = (0, 140, 255)
+            status_text = "STANDBY: CLICK PERSON OR PRESS [1-9] TO SELECT TARGET"
+            badge_color = (0, 220, 255)
 
         (sw, sh), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(img, (10, 10), (20 + sw, 20 + sh + 4), (30, 30, 30), -1)
-        cv2.rectangle(img, (10, 10), (20 + sw, 20 + sh + 4), badge_color, 1)
+        cv2.rectangle(img, (10, 10), (20 + sw, 20 + sh + 6), (30, 30, 30), -1)
+        cv2.rectangle(img, (10, 10), (20 + sw, 20 + sh + 6), badge_color, 2)
         cv2.putText(img, status_text, (15, 16 + sh), cv2.FONT_HERSHEY_SIMPLEX, 0.5, badge_color, 1, cv2.LINE_AA)
+
+        # Bottom help instruction bar
+        help_text = "Select: Click Box or Press 1/2 | Deselect/Hover: Press 0 or SPACE"
+        cv2.rectangle(img, (10, ih - 30), (iw - 10, ih - 8), (20, 20, 20), -1)
+        cv2.putText(img, help_text, (16, ih - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
         self.pub_debug.publish(self.bridge.cv2_to_imgmsg(img, 'bgr8'))
 

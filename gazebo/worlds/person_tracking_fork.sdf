@@ -1,0 +1,451 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="person_tracking_path">
+    <!-- 1. Cấu hình Physics: max_step_size 1ms, real_time_factor 1.0 -->
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- 2. Các Plugin gz-sim cốt lõi -->
+    <plugin filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+
+    <!-- 3. Scene & Sky & Ánh sáng môi trường -->
+    <scene>
+      <ambient>0.8 0.8 0.8 1.0</ambient>
+      <background>0.7 0.85 1.0 1.0</background>
+      <sky>
+        <clouds>
+          <speed>12</speed>
+        </clouds>
+      </sky>
+    </scene>
+
+    <!-- 4. Toạ độ địa lý (GPS/NavSat cho ArduPilot SITL) -->
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <!-- 5. Nguồn sáng mặt trời (Directional Sun Light - đủ sáng cho YOLO Camera) -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 50 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.4 0.2 -0.9</direction>
+    </light>
+
+    <!-- 6. Trục toạ độ tham chiếu + GPS NavSat Sensor cho SITL -->
+    <model name="axes">
+      <static>1</static>
+      <link name="link">
+        <visual name="r">
+          <cast_shadows>0</cast_shadows>
+          <pose>5 0 0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.05 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 0.8</ambient>
+            <diffuse>1 0 0 0.8</diffuse>
+            <emissive>1 0 0 0.8</emissive>
+          </material>
+        </visual>
+        <visual name="g">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 5 0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.05 10 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 1 0 0.8</ambient>
+            <diffuse>0 1 0 0.8</diffuse>
+            <emissive>0 1 0 0.8</emissive>
+          </material>
+        </visual>
+        <visual name="b">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 0 5.0 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.05 0.05 10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 0 1 0.8</ambient>
+            <diffuse>0 0 1 0.8</diffuse>
+            <emissive>0 0 1 0.8</emissive>
+          </material>
+        </visual>
+        <sensor name="navsat_sensor" type="navsat">
+          <always_on>1</always_on>
+          <update_rate>1</update_rate>
+        </sensor>
+      </link>
+    </model>
+
+    <!-- 7. Mặt đất bãi cỏ rộng (Ground Grass Plane >= 140x140m) -->
+    <model name="ground_grass">
+      <static>true</static>
+      <link name="ground_link">
+        <collision name="ground_collision">
+          <pose>0 0 -0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>140 140 0.10</size>
+            </box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>100</mu>
+                <mu2>50</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="ground_visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>140 140</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.22 0.48 0.16 1.0</ambient>
+            <diffuse>0.28 0.55 0.20 1.0</diffuse>
+            <specular>0.05 0.08 0.05 1.0</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 8. Con đường Vỉa hè chia 2 nhánh (Fork / Branching Walkway) -->
+    <model name="fork_walkway">
+      <static>true</static>
+      <link name="walkway_link">
+        <!-- Đoạn xuất phát chung: từ (0, 5) đến (10, 5) rộng 4.0m cho 2 người đứng -->
+        <visual name="main_stem_visual">
+          <pose>5.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.5 4.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.62 0.62 0.62 1.0</ambient>
+            <diffuse>0.68 0.68 0.68 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="main_stem_col">
+          <pose>5.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.5 4.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- === NHÁNH 1 (BẮC / TRÁI - NORTH BRANCH) === -->
+        <!-- Đoạn 1A: Từ (10, 5) rẽ Bắc lên (10, 18) -->
+        <visual name="north_seg1_visual">
+          <pose>10.0 11.5 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="north_seg1_col">
+          <pose>10.0 11.5 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 1B: Từ (10, 18) rẽ Đông đến (28, 18) -->
+        <visual name="north_seg2_visual">
+          <pose>19.0 18.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>20.5 2.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.62 0.62 0.62 1.0</ambient>
+            <diffuse>0.68 0.68 0.68 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="north_seg2_col">
+          <pose>19.0 18.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>20.5 2.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- === NHÁNH 2 (NAM / PHẢI - SOUTH BRANCH) === -->
+        <!-- Đoạn 2A: Từ (10, 5) rẽ Nam xuống (10, -8) -->
+        <visual name="south_seg1_visual">
+          <pose>10.0 -1.5 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="south_seg1_col">
+          <pose>10.0 -1.5 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 2B: Từ (10, -8) rẽ Đông đến (28, -8) -->
+        <visual name="south_seg2_visual">
+          <pose>19.0 -8.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>20.5 2.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.62 0.62 0.62 1.0</ambient>
+            <diffuse>0.68 0.68 0.68 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="south_seg2_col">
+          <pose>19.0 -8.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>20.5 2.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- 9. Drone Iris với Gimbal + Camera -->
+    <include>
+      <uri>model://iris_with_gimbal</uri>
+      <pose degrees="true">-2.0 5.0 0.35 0 0 0</pose>
+    </include>
+
+    <!-- 10. NGƯỜI 1 (Actor 1: person_1) - Đi Nhánh Bắc (Trái) sau 60 giây -->
+    <actor name="person_1">
+      <skin>
+        <filename>https://fuel.gazebosim.org/1.0/mingfei/models/actor/1/files/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+      </skin>
+      <animation name="walk">
+        <filename>https://fuel.gazebosim.org/1.0/mingfei/models/actor/1/files/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+        <interpolate_x>true</interpolate_x>
+      </animation>
+      <script>
+        <loop>true</loop>
+        <delay_start>0.0</delay_start>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="walk">
+          <!-- Đứng yên tại vị trí (0.0, 6.2) trong 60 giây đầu -->
+          <waypoint>
+            <time>0.0</time>
+            <pose>0.0 6.2 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>60.0</time>
+            <pose>0.0 6.2 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Giây 60: Bắt đầu xuất phát đi thẳng tới ngã ba (10.0, 6.2) -->
+          <waypoint>
+            <time>70.0</time>
+            <pose>10.0 6.2 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Giây 71: Rẽ trái 90 độ hướng Bắc -->
+          <waypoint>
+            <time>71.0</time>
+            <pose>10.0 6.2 0.8891414 0 0 1.5708</pose>
+          </waypoint>
+          <!-- Giây 83: Đi dọc nhánh Bắc đến (10.0, 18.0) -->
+          <waypoint>
+            <time>83.0</time>
+            <pose>10.0 18.0 0.8891414 0 0 1.5708</pose>
+          </waypoint>
+          <!-- Giây 84: Rẽ phải 90 độ hướng Đông -->
+          <waypoint>
+            <time>84.0</time>
+            <pose>10.0 18.0 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Giây 99: Đi thẳng đến cuối nhánh Bắc (26.0, 18.0) -->
+          <waypoint>
+            <time>99.0</time>
+            <pose>26.0 18.0 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Quay đầu lặp lại -->
+          <waypoint>
+            <time>101.0</time>
+            <pose>26.0 18.0 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>116.0</time>
+            <pose>10.0 18.0 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>117.0</time>
+            <pose>10.0 18.0 0.8891414 0 0 -1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>129.0</time>
+            <pose>10.0 6.2 0.8891414 0 0 -1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>130.0</time>
+            <pose>10.0 6.2 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>140.0</time>
+            <pose>0.0 6.2 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>141.0</time>
+            <pose>0.0 6.2 0.8891414 0 0 0.0</pose>
+          </waypoint>
+        </trajectory>
+      </script>
+    </actor>
+
+    <!-- 11. NGƯỜI 2 (Actor 2: person_2) - Đi Nhánh Nam (Phải) sau 60 giây -->
+    <actor name="person_2">
+      <skin>
+        <filename>https://fuel.gazebosim.org/1.0/mingfei/models/actor/1/files/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+      </skin>
+      <animation name="walk">
+        <filename>https://fuel.gazebosim.org/1.0/mingfei/models/actor/1/files/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+        <interpolate_x>true</interpolate_x>
+      </animation>
+      <script>
+        <loop>true</loop>
+        <delay_start>0.0</delay_start>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="walk">
+          <!-- Đứng yên tại vị trí (0.0, 3.8) trong 60 giây đầu -->
+          <waypoint>
+            <time>0.0</time>
+            <pose>0.0 3.8 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>60.0</time>
+            <pose>0.0 3.8 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Giây 60: Bắt đầu xuất phát đi thẳng tới ngã ba (10.0, 3.8) -->
+          <waypoint>
+            <time>70.0</time>
+            <pose>10.0 3.8 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Giây 71: Rẽ phải 90 độ hướng Nam -->
+          <waypoint>
+            <time>71.0</time>
+            <pose>10.0 3.8 0.8891414 0 0 -1.5708</pose>
+          </waypoint>
+          <!-- Giây 83: Đi dọc nhánh Nam xuống (10.0, -8.0) -->
+          <waypoint>
+            <time>83.0</time>
+            <pose>10.0 -8.0 0.8891414 0 0 -1.5708</pose>
+          </waypoint>
+          <!-- Giây 84: Rẽ trái 90 độ hướng Đông -->
+          <waypoint>
+            <time>84.0</time>
+            <pose>10.0 -8.0 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Giây 99: Đi thẳng đến cuối nhánh Nam (26.0, -8.0) -->
+          <waypoint>
+            <time>99.0</time>
+            <pose>26.0 -8.0 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <!-- Quay đầu lặp lại -->
+          <waypoint>
+            <time>101.0</time>
+            <pose>26.0 -8.0 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>116.0</time>
+            <pose>10.0 -8.0 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>117.0</time>
+            <pose>10.0 -8.0 0.8891414 0 0 1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>129.0</time>
+            <pose>10.0 3.8 0.8891414 0 0 1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>130.0</time>
+            <pose>10.0 3.8 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>140.0</time>
+            <pose>0.0 3.8 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>141.0</time>
+            <pose>0.0 3.8 0.8891414 0 0 0.0</pose>
+          </waypoint>
+        </trajectory>
+      </script>
+    </actor>
+
+  </world>
+</sdf>
