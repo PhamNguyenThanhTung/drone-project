@@ -2,40 +2,62 @@
 set -e
 export PYTHONUNBUFFERED=1
 source /opt/ros/humble/setup.bash
-source /home/tungt/phase2_ws/install/setup.bash
+# colcon copies (not symlinks) the python sources into install/, so a stale
+# install silently served the pre-fix yolo_detector_node to `ros2 run` while
+# every direct-source test used the new code. Rebuilding costs ~1 s; running
+# yesterday's detector cost a whole debugging session.
+echo "[0/5] Rebuild ROS 2 workspace (guard against a stale install)..."
+(cd /home/tungt/drone-project/ros2_ws && colcon build --symlink-install)
+if [[ -f /home/tungt/drone-project/ros2_ws/install/setup.bash ]]; then
+  source /home/tungt/drone-project/ros2_ws/install/setup.bash
+fi
 
 export GZ_VERSION=harmonic
-export GZ_SIM_SYSTEM_PLUGIN_PATH=/home/tungt/ardupilot_gazebo/build:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}
-export GZ_SIM_RESOURCE_PATH=/home/tungt/ardupilot_gazebo/models:/home/tungt/ardupilot_gazebo/worlds:${GZ_SIM_RESOURCE_PATH:-}
-export LD_LIBRARY_PATH=/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}
+# person_tracking_approach paces its actor 3-8 m ahead of the spawn point, so a
+# person is inside the 37 deg down-pitched camera's ground patch (~0.2-17 m)
+# right after takeoff. The older person_tracking_no_trees actor spends most of
+# its loop 20-30 m out, i.e. out of frame, which looks exactly like a broken
+# detector: no boxes, nothing to click. Override with WORLD_NAME=... if needed.
+export WORLD_NAME="${WORLD_NAME:-person_tracking_approach}"
+export PX4_GZ_WORLD="${WORLD_NAME}"
+export PX4_SIM_MODEL="${PX4_SIM_MODEL:-x500}"
+export GZ_SIM_RESOURCE_PATH="/home/tungt/drone-project/gazebo/models:/home/tungt/drone-project/gazebo/worlds:/home/tungt/PX4-Autopilot/Tools/simulation/gz/models:/home/tungt/PX4-Autopilot/Tools/simulation/gz/worlds:${GZ_SIM_RESOURCE_PATH:-}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
 
-WORLD_NAME="${WORLD_NAME:-person_tracking_no_trees}"
-WORLD_FILE="${WORLD_FILE:-/home/tungt/ardupilot_gazebo/worlds/${WORLD_NAME}.sdf}"
-echo "Sử dụng Gazebo World: ${WORLD_FILE}"
-CAMERA_TOPIC="${CAMERA_TOPIC:-/world/person_tracking_path/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image}"
+# Để Gazebo mở giao diện đồ họa 3D GUI, unset biến HEADLESS
+unset HEADLESS
 
-# Dọn process cũ
+echo "======================================================="
+echo "   KHỞI ĐỘNG HỆ THỐNG PX4 SITL + GAZEBO HARMONIC       "
+echo "======================================================="
+echo "Gazebo World: ${WORLD_NAME}"
+echo "Quadcopter Model: ${PX4_SIM_MODEL}"
+
+# Dọn dẹp process cũ
+# Match only the PX4 runtime executable.  A broad `-f px[4]` also matches
+# this script's `make px4_sitl` command and can kill the build before startup.
+pkill -9 -x px4 2>/dev/null || true
 pkill -9 -f "gz si[m]" 2>/dev/null || true
-pkill -9 -x arducopter 2>/dev/null || true
-pkill -9 -f "sim_vehicl[e]" 2>/dev/null || true
-pkill -9 -f "xter[m]" 2>/dev/null || true
 pkill -9 -f "mavproxy.p[y]" 2>/dev/null || true
 pkill -9 -f "parameter_brid[g]e" 2>/dev/null || true
 pkill -9 -f "yolo_detector_nod[e]" 2>/dev/null || true
 pkill -9 -f "gimbal_controller_no[d]" 2>/dev/null || true
 pkill -9 -f "vehicle_yaw_searc[h]" 2>/dev/null || true
+pkill -9 -f "motion_arbite[r]" 2>/dev/null || true
+pkill -9 -f "live_camera_hu[d]" 2>/dev/null || true
+pkill -9 -f "QGroundControl" 2>/dev/null || true
 sleep 1
 
 cleanup() {
+  pkill -TERM -f "QGroundControl" 2>/dev/null || true
   pkill -TERM -f "live_camera_hu[d]" 2>/dev/null || true
   pkill -TERM -f "gimbal_controller_no[d]" 2>/dev/null || true
+  pkill -TERM -f "motion_arbite[r]" 2>/dev/null || true
   pkill -TERM -f "vehicle_yaw_searc[h]" 2>/dev/null || true
   pkill -TERM -f "yolo_detector_nod[e]" 2>/dev/null || true
   pkill -TERM -f "parameter_brid[g]e" 2>/dev/null || true
-  pkill -TERM -x arducopter 2>/dev/null || true
-  pkill -TERM -f "sim_vehicl[e]" 2>/dev/null || true
-  pkill -TERM -f "xter[m]" 2>/dev/null || true
   pkill -TERM -f "gz si[m]" 2>/dev/null || true
+  pkill -TERM -x px4 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -50,95 +72,83 @@ require_alive() {
   fi
 }
 
-echo "[1/5] Khởi động ArduPilot SITL (chờ Gazebo JSON)..."
-(cd /home/tungt/ardupilot && \
-  Tools/autotest/sim_vehicle.py -N -v ArduCopter -f JSON \
-  --add-param-file=/home/tungt/ardupilot_gazebo/config/gazebo-iris-gimbal.parm \
-  --no-mavproxy --console) > /tmp/sitl.log 2>&1 &
-SITL_PID=$!
-sleep 2
-require_alive "$SITL_PID" "ArduPilot SITL" /tmp/sitl.log
+echo "[1/5] Khởi động PX4 Autopilot SITL + Gazebo Harmonic 3D GUI..."
+install -m 644 \
+  "/home/tungt/drone-project/gazebo/worlds/${WORLD_NAME}.sdf" \
+  "/home/tungt/PX4-Autopilot/Tools/simulation/gz/worlds/${WORLD_NAME}.sdf"
+install -m 644 \
+  "/home/tungt/drone-project/gazebo/models/x500/model.sdf" \
+  "/home/tungt/PX4-Autopilot/Tools/simulation/gz/models/x500/model.sdf"
+install -m 644 \
+  "/home/tungt/PX4-Autopilot/ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500" \
+  "/home/tungt/PX4-Autopilot/build/px4_sitl_default/etc/init.d-posix/airframes/4001_gz_x500" 2>/dev/null || true
 
-echo "[2/5] Khởi động Gazebo Harmonic..."
-# Mặc định dùng GPU/WSLg renderer. Chỉ đặt USE_SOFTWARE_RENDERING=1
-# trên máy không có GPU passthrough hoặc khi driver không khởi tạo được.
 if [[ "${USE_SOFTWARE_RENDERING:-0}" == "1" ]]; then
   export LIBGL_ALWAYS_SOFTWARE=1
 else
   unset LIBGL_ALWAYS_SOFTWARE
 fi
-GZ_ARGS=(-v4 -r)
-if [[ -n "${GZ_PHYSICS_ENGINE:-}" ]]; then
-  echo "Gazebo physics engine: ${GZ_PHYSICS_ENGINE}"
-  GZ_ARGS+=(--physics-engine "${GZ_PHYSICS_ENGINE}")
-fi
-if [[ "${HEADLESS:-0}" == "1" ]]; then
-  GZ_ARGS+=(-s)
-fi
-gz sim "${GZ_ARGS[@]}" \
-  "${WORLD_FILE}" > /tmp/gz_sim.log 2>&1 &
-GZ_PID=$!
-sleep 4
-require_alive "$GZ_PID" "Gazebo" /tmp/gz_sim.log
 
-echo "[3/5] Khởi động ROS 2 parameter bridge..."
+(cd /home/tungt/PX4-Autopilot && make px4_sitl gz_x500) > /tmp/px4_sim.log 2>&1 &
+PX4_PID=$!
+sleep 10
+require_alive "$PX4_PID" "PX4 SITL + Gazebo" /tmp/px4_sim.log
+
+echo "[2/5] Khởi động ROS 2 parameter bridge..."
+# Bridge cho Camera Image
 ros2 run ros_gz_bridge parameter_bridge \
-  "${CAMERA_TOPIC}@sensor_msgs/msg/Image[gz.msgs.Image" \
-  "/gimbal/cmd_yaw@std_msgs/msg/Float64]gz.msgs.Double" \
-  "/gimbal/cmd_pitch@std_msgs/msg/Float64]gz.msgs.Double" > /tmp/ros_bridge.log 2>&1 &
+  "/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image" > /tmp/ros_bridge.log 2>&1 &
 BRIDGE_PID=$!
 sleep 2
 require_alive "$BRIDGE_PID" "ROS-Gazebo bridge" /tmp/ros_bridge.log
 
-echo "[4/5] Khởi động YOLO Detector..."
-if [[ -z "${YOLO_DEVICE:-}" ]]; then
-  if python3 -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
-    YOLO_DEVICE=cuda:0
-  else
-    YOLO_DEVICE=cpu
+echo "[3/5] Khởi động YOLO Detector..."
+# YOLO is intentionally CUDA-first.  Do not silently fall back to CPU: that
+# hides a broken WSL/NVIDIA passthrough and makes tracking latency unpredictable.
+YOLO_DEVICE="${YOLO_DEVICE:-cuda:0}"
+if [[ "${YOLO_DEVICE,,}" == cuda* ]]; then
+  if ! python3 -c 'import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
+    echo "ERROR: YOLO is configured for ${YOLO_DEVICE}, but CUDA is unavailable." >&2
+    echo "       Repair the Windows NVIDIA driver/WSL GPU passthrough, then rerun start_stack.sh." >&2
+    echo "       Diagnostic: python3 -c 'import torch; print(torch.cuda.is_available())'" >&2
+    exit 1
   fi
+  echo "RTX/CUDA detected: using ${YOLO_DEVICE}"
+else
+  echo "YOLO device override: ${YOLO_DEVICE}"
 fi
-echo "YOLO device: ${YOLO_DEVICE}"
 if [[ "${SHOW_HUD:-1}" == "1" ]]; then
   YOLO_DEBUG=True
 else
   YOLO_DEBUG="${YOLO_DEBUG:-False}"
 fi
 ros2 run vision_tracking yolo_detector_node \
-  --ros-args -p image_topic:=${CAMERA_TOPIC} \
-  -p model_path:=${YOLO_MODEL:-/home/tungt/phase2_ws/models/yolov8s.pt} \
+  --ros-args -p image_topic:=/camera/image_raw \
+  -p model_path:=${YOLO_MODEL:-/home/tungt/drone-project/yolov8n.pt} \
   -p device:=${YOLO_DEVICE} -p infer_imgsz:=${YOLO_IMGSZ:-640} \
-  -p show_debug_image:=${YOLO_DEBUG:-False} -p conf:=${YOLO_CONF:-0.50} > /tmp/yolo.log 2>&1 &
+  -p show_debug_image:=${YOLO_DEBUG:-False} -p conf:=${YOLO_CONF:-0.45} > /tmp/yolo.log 2>&1 &
 YOLO_PID=$!
 sleep 2
 require_alive "$YOLO_PID" "YOLO detector" /tmp/yolo.log
 
-echo "[5/5] Khởi động Gimbal PID Controller..."
-CAMERA_PITCH_RAD="${CAMERA_PITCH_RAD:-0.65}"
-echo "Camera pitch: ${CAMERA_PITCH_RAD} rad (~37 deg down)"
-ros2 run vision_tracking gimbal_controller_node \
-  --ros-args -p init_pitch:=${CAMERA_PITCH_RAD} -p init_yaw:=0.0 \
-  -p min_yaw:=0.0 -p max_yaw:=0.0 -p max_yaw_rate:=0.0 \
-  -p min_pitch:=${CAMERA_PITCH_RAD} -p max_pitch:=${CAMERA_PITCH_RAD} \
-  -p search_enabled:=False > /tmp/gimbal.log 2>&1 &
-GIMBAL_PID=$!
-sleep 1
-require_alive "$GIMBAL_PID" "Gimbal controller" /tmp/gimbal.log
-
-echo "[6/6] Khởi động vehicle yaw tracking/search..."
+echo "[5/5] Khởi động MotionArbiter (PX4 OFFBOARD State Machine)..."
 TAKEOFF_ALT="${TAKEOFF_ALT:-3.8}"
-# ROS 2 infers `3` as INTEGER, but vehicle_yaw_search declares this as DOUBLE.
-# Normalize shell input so TAKEOFF_ALT=3 and TAKEOFF_ALT=3.0 are equivalent.
 printf -v TAKEOFF_ALT_ROS '%.6f' "${TAKEOFF_ALT}"
 echo "Auto takeoff altitude: ${TAKEOFF_ALT_ROS} m"
-python3 /home/tungt/drone-project/vehicle_yaw_search.py \
-  --ros-args -p takeoff_alt:=${TAKEOFF_ALT_ROS} > /tmp/vehicle_yaw.log 2>&1 &
-YAW_PID=$!
+python3 /home/tungt/drone-project/motion_arbiter.py \
+  --ros-args -p takeoff_alt:=${TAKEOFF_ALT_ROS} -p auto_takeoff:=True -p mavlink:=udpin:0.0.0.0:14540 > /tmp/motion_arbiter.log 2>&1 &
+ARBITER_PID=$!
 sleep 2
-require_alive "$YAW_PID" "Vehicle yaw tracker" /tmp/vehicle_yaw.log
+require_alive "$ARBITER_PID" "MotionArbiter" /tmp/motion_arbiter.log
+
+if [[ "${LAUNCH_QGC:-1}" == "1" ]] && [ -x /home/tungt/QGroundControl.AppImage ]; then
+  echo "Tự động khởi động QGroundControl..."
+  /home/tungt/QGroundControl.AppImage > /tmp/qgc.log 2>&1 &
+  sleep 1
+fi
 
 if [[ "${SHOW_HUD:-1}" == "1" ]]; then
-  echo "Mở cửa sổ camera YOLO..."
+  echo "Mở cửa sổ camera YOLO & HUD..."
   python3 /home/tungt/drone-project/live_camera_hud.py \
     --topic /tracking/debug_image > /tmp/camera_hud.log 2>&1 &
   HUD_PID=$!
@@ -146,6 +156,9 @@ if [[ "${SHOW_HUD:-1}" == "1" ]]; then
   require_alive "$HUD_PID" "Camera HUD" /tmp/camera_hud.log
 fi
 
-echo "Toàn bộ stack Phase 2 đã sẵn sàng!"
+echo "======================================================="
+echo "   PX4 AUTOPILOT + GAZEBO HARMONIC SẴN SÀNG!            "
+echo "   QGroundControl đang chạy và tự động kết nối UDP 14550"
+echo "======================================================="
 echo "Nhấn Ctrl-C để dừng toàn bộ stack."
 wait

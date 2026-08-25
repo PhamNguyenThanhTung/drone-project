@@ -1,182 +1,90 @@
-# 🚁 Autonomous Drone Vision Tracking System
+# UAV Vision Tracking & Autonomous Follower (PX4 SITL + Gazebo Harmonic)
 
-Hệ thống điều khiển Drone tự động nhận diện, khóa mục tiêu tùy chọn và bám đuổi người đi bộ theo thời gian thực (Interactive Multi-Person Following Drone) kết hợp **ArduPilot SITL**, **Gazebo Harmonic**, **ROS 2 Humble**, **YOLOv8** và **ByteTrack**.
-
----
-
-## 📋 Mục Lục
-1. [Giới Thiệu & Tính Năng Nổi Bật](#-giới-thiệu--tính-năng-nổi-bật)
-2. [Cấu Trúc Thư Mục & Vai Trò Từng File](#-cấu-trúc-thư-mục--vai-trò-từng-file)
-3. [Yêu Cầu Hệ Thống & Hướng Dẫn Cài Đặt](#-yêu-cầu-hệ-thống--hướng-dẫn-cài-đặt)
-4. [Hướng Dẫn Chạy Dự Án & Chọn Mục Tiêu](#-hướng-dẫn-chạy-dự-án--chọn-mục-tiêu)
-5. [Nguyên Lý Hoạt Động Cốt Lõi](#-nguyên-lý-hoạt-động-cốt-lõi)
+Hệ thống bám đuổi mục tiêu thông minh thời gian thực (Autonomous Vision Tracking & Teleop) cho Drone Quadcopter sử dụng **PX4 Autopilot SITL**, **Gazebo Harmonic**, **ROS 2 Humble**, **YOLOv8 + ByteTrack**, **OSNet Re-ID**, và kiến trúc **State Machine MotionArbiter**.
 
 ---
 
-## 🌟 Giới Thiệu & Tính Năng Nổi Bật
+## 1. Yêu cầu Hệ thống & Cài đặt Môi trường (Installation Guide)
 
-- **🎯 Multi-Person Target Selection (Khóa mục tiêu người tùy chọn)**:
-  - Khi có nhiều người trong khung hình, hệ thống gán nhãn `[ID: 1]`, `[ID: 2]`... cho từng người.
-  - **Tương tác trực tiếp qua Live HUD**: Người dùng có thể **Click chuột trực tiếp** vào ô của người muốn bám đuổi, hoặc **bấm phím số `1`, `2`, `3`...** trên bàn phím.
-  - **Chế độ Standby / Hover**: Nếu chưa chọn ai (hoặc bấm `0` / `SPACE`), Drone sẽ **đứng yên bay tại chỗ (Hover)**, không bám lung tung.
-- **⚡ 60s Standstill & 2 Branching Paths World (`person_tracking_fork.sdf`)**:
-  - 2 người đứng yên trong **60 giây đầu** để người dùng quan sát và chọn mục tiêu.
-  - Sau 60s, Người 1 rẽ nhánh **Bắc (Trái)**, Người 2 rẽ nhánh **Nam (Phải)**. Drone sẽ bám sát đúng người đã chọn!
-- **📐 Thuật toán Hình học 3D Pinhole & Vượt Tán Cây (Tree Clearance)**:
-  - Tính toán khoảng cách mặt đất thực tế $d_x, d_y$ từ camera tới người:
-    $$d_x = \frac{h_{\text{rel}}}{\tan(\theta_{\text{pitch}} + \alpha_y)}, \quad d_y = d_x \cdot \frac{e_x}{f_x}$$
-  - Tự động cộng thêm khoảng đệm an toàn $+1.8\text{m}$ (`tree_clearance_margin`) khi người rẽ/đi khuất sau cây để Drone bay thẳng vượt qua tán lá trước khi xoay hướng tại khúc cua.
-- **🛡️ 50% Safe Zone Deadband**: Giữ tâm mục tiêu trong vùng an toàn 50% khung hình giúp Drone bay êm ái, loại bỏ hoàn toàn hiện tượng rung lắc.
-- **✨ Hiển Thị Vùng Thu Camera (FOV Ray Frustum)**: 4 tia laser phát sáng màu xanh Cyan định vị vùng nhìn của camera xuống mặt đất trong cửa sổ 3D Gazebo (tự động ẩn trên camera thực tế bằng `visibility_mask`).
+### Yêu cầu nền tảng:
+* **Hệ điều hành**: Ubuntu 22.04 LTS (Native hoặc WSL2 trên Windows 10/11)
+* **ROS 2**: ROS 2 Humble Desktop (`ros-humble-desktop`)
+* **Mô phỏng**: Gazebo Harmonic (`gz-sim8`, `ros-humble-ros-gz-bridge`)
+* **Flight Stack**: PX4-Autopilot (`v1.14` / `v1.15`)
+* **Python**: Python 3.10+ với PyTorch (GPU CUDA hoặc CPU)
 
----
-
-## 📁 Cấu Trúc Thư Mục & Vai Trò Từng File
-
-```text
-drone-project/
-├── README.md                      # Tài liệu hướng dẫn cài đặt, sử dụng và nguyên lý
-├── .gitignore                     # Cấu hình bỏ qua file build, cache, log khi push git
-├── start_stack.sh                 # Script Bash 1-Click khởi động toàn bộ pipeline
-├── vehicle_yaw_search.py          # Node điều khiển Drone: bay bám đuổi, tính khoảng cách 3D và vượt tán cây
-├── live_camera_hud.py             # Node hiển thị Live Camera HUD (Click chuột / Phím chọn mục tiêu)
-├── flight_teleop.py               # Tiện ích điều khiển Drone thủ công qua bàn phím (WASD / MAVLink)
-│
-├── ros2_ws/                       # Không gian làm việc ROS 2
-│   └── src/
-│       └── vision_tracking/       # Package ROS 2 xử lý thị giác máy tính
-│           ├── package.xml        # Định nghĩa thông tin package & dependencies ROS 2
-│           ├── setup.py           # File cài đặt và đăng ký executable node
-│           └── vision_tracking/
-│               ├── yolo_detector_node.py   # Node YOLOv8 + ByteTrack: phát hiện, gán ID và chọn mục tiêu
-│               ├── gimbal_controller_node.py # Node điều khiển Gimbal độc lập
-│               └── tracking_eval.py        # Module đánh giá độ trễ và hiệu năng bám đuổi
-│
-├── gazebo/                        # Tài nguyên mô phỏng Gazebo
-│   ├── worlds/
-│   │   ├── person_tracking_fork.sdf     # World ngã ba 2 nhánh: 2 người đứng 60s rồi rẽ 2 hướng (Mặc định)
-│   │   ├── person_tracking_no_trees.sdf # World công viên thoáng 1 người không có cây
-│   │   └── person_tracking_path.sdf     # World công viên có hàng cây sồi/thông để test vượt tán cây
-│   ├── models/
-│   │   ├── gimbal_small_3d/       # Model Gimbal 3D tích hợp Camera và 4 tia laser FOV Frustum
-│   │   └── iris_with_gimbal/      # Model Drone Quadcopter Iris gắn kèm Gimbal 3D
-│   └── config/
-│       └── gazebo-iris-gimbal.parm # File tham số ArduPilot Copter cho mô phỏng Gazebo
-│
-└── docs/
-    ├── setup.md                   # Hướng dẫn chi tiết thiết lập môi trường từ đầu
-    ├── part2.md                   # Tài liệu thiết kế hệ thống theo dõi mục tiêu
-    ├── PHASE2_5_PLAN.md           # Kế hoạch phát triển các pha điều khiển
-    └── PHASE2_ACCEPTANCE.md       # Tiêu chuẩn nghiệm thu chức năng
-```
-
----
-
-## 💻 Yêu Cầu Hệ Thống & Hướng Dẫn Cài Đặt
-
-### 1. Yêu cầu phần mềm & phần cứng
-- **Hệ điều hành**: Ubuntu 22.04 LTS (hoặc WSL2 Ubuntu 22.04 trên Windows 11).
-- **GPU**: NVIDIA GPU hỗ trợ CUDA (khuyến nghị để YOLOv8 inference đạt >30 FPS).
-- **ROS 2**: ROS 2 Humble Hawksbill.
-- **Gazebo**: Gazebo Harmonic (GZ Sim 8).
-- **ArduPilot**: ArduPilot SITL Copter-4.5+ kèm plugin `ardupilot_gazebo`.
-
----
-
-### 2. Cài đặt các gói phụ thuộc (Dependencies)
-
-#### A. Cài đặt ROS 2 Humble & ROS-Gazebo Bridge:
-```bash
-sudo apt update && sudo apt install -y \
-  ros-humble-desktop \
-  ros-humble-ros-gz \
-  ros-humble-ros-gz-bridge \
-  ros-humble-cv-bridge \
-  ros-humble-image-transport \
-  python3-colcon-common-extensions
-```
-
-#### B. Cài đặt các thư viện Python:
-```bash
-pip3 install --upgrade pip
-pip3 install ultralytics torch torchvision opencv-python pymavlink scipy
-```
-
-#### C. Cài đặt ArduPilot SITL:
-```bash
-cd ~
-git clone --recurse-submodules https://github.com/ArduPilot/ardupilot.git
-cd ardupilot
-Tools/environment_install/install-prereqs-ubuntu.sh -y
-. ~/.profile
-./waf configure --board sitl
-./waf copter
-```
-
-#### D. Cài đặt Plugin ardupilot_gazebo:
-```bash
-cd ~
-git clone https://github.com/ArduPilot/ardupilot_gazebo.git
-cd ardupilot_gazebo
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
-make -j$(nproc)
-```
-
-#### E. Tải mô hình YOLOv8:
-```bash
-mkdir -p ~/phase2_ws/models
-cd ~/phase2_ws/models
-wget https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8s.pt
-```
-
----
-
-### 3. Build ROS 2 Workspace
+### Các bước cài đặt từ đầu (Setup Steps):
 
 ```bash
+# 1. Cài đặt các gói phụ thuộc Python
+pip3 install --user ultralytics pymavlink mavsdk opencv-python kconfiglib jinja2 "empy<4" jsonschema pyyaml
+
+# 2. Biên dịch workspace ROS 2
 cd ~/drone-project/ros2_ws
-source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 source install/setup.bash
+
+# 3. Tải QGroundControl AppImage (Nếu chưa có)
+curl -L -o ~/QGroundControl.AppImage https://github.com/mavlink/qgroundcontrol/releases/download/v5.1.3/QGroundControl-x86_64.AppImage
+chmod +x ~/QGroundControl.AppImage
 ```
 
 ---
 
-## 🚀 Hướng Dẫn Chạy Dự Án & Chọn Mục Tiêu
+## 2. Khởi chạy Hệ thống (Single Command Launch)
 
-### 1. Khởi động hệ thống (Chế độ 2 người rẽ 2 hướng sau 60s - Mặc định):
+Chỉ cần chạy một script duy nhất:
+
 ```bash
 cd ~/drone-project
-chmod +x start_stack.sh
 ./start_stack.sh
 ```
 
-### 2. Cách chọn mục tiêu trong cửa sổ Live Camera HUD:
-- **Cách 1 (Click chuột)**: Click chuột trái trực tiếp vào ô người muốn theo dõi trên cửa sổ Camera HUD.
-- **Cách 2 (Phím số)**: Nhấn phím số `1` để khóa Người 1 (đi nhánh Bắc), nhấn `2` để khóa Người 2 (đi nhánh Nam).
-- **Hủy chọn / Đứng yên (Hover)**: Nhấn phím `0` hoặc phím cách `SPACE`.
+### Các thành phần sẽ tự động mở lên đồng thời:
+1. **Gazebo Harmonic 3D Simulation**: Thế giới công viên mô phỏng với người đi bộ và Quadcopter `x500`.
+2. **QGroundControl (QGC)**: Tự động kết nối UDP `14550`, hiển thị tọa độ GPS, la bàn, cao độ EKF2 và bản đồ vệ tinh.
+3. **Live Camera HUD (OpenCV POV)**: Cửa sổ hiển thị trực quan góc nhìn từ Drone với YOLO Bounding Box, 50% Safe Zone, thanh trạng thái State Machine, **minimap 25 m (Bắc hướng lên)** và **bảng GPS trực tiếp** (LAT/LON/ALT + khoảng cách tới HOME) ở góc trái — kiểu QGroundControl thu nhỏ ngay trên hình camera. Click vào minimap để gửi lệnh GOTO tới vị trí tương ứng.
+4. **MotionArbiter Node**: Tự động ARM động cơ, cất cánh lên $3.8\text{ m}$, kích hoạt chế độ **OFFBOARD** và bắt đầu bám đuổi mục tiêu.
 
-### 3. Chạy các môi trường khác:
-- **World công viên có cây (Né / Vượt tán cây)**:
-  ```bash
-  WORLD_NAME=person_tracking_path ./start_stack.sh
-  ```
-- **World công viên thoáng 1 người (Không cây)**:
-  ```bash
-  WORLD_NAME=person_tracking_no_trees ./start_stack.sh
-  ```
+> **Về nhãn trên màn hình**: các box chỉ được gán nhãn `PERSON` / `PERSON [LOCK]` — **không hiển thị số track ID** vì ByteTrack cấp ID mới mỗi vài frame khi chạy CPU, số nhảy liên tục khiến tưởng như mất dấu. ID vẫn được quản lý nội bộ: khóa bị mất ID sẽ tự ghép lại với box chồng lên box cũ (IoU) trong 2.5 s.
 
 ---
 
-## 🧠 Nguyên Lý Hoạt Động Cốt Lõi
+## 3. Bảng Điều khiển Phím & Thao tác Chuột
 
-1. **Khởi động & Cất cánh tự động**:
-   - `start_stack.sh` khởi tạo ArduPilot SITL và Gazebo Harmonic.
-   - Drone tự động chuyển sang chế độ `GUIDED`, Arm động cơ và cất cánh lên độ cao $3.8\text{m}$.
-2. **Liệt kê Candidate & Chờ Người Dùng Chọn**:
-   - `yolo_detector_node` phát hiện tất cả người trong khung hình, hiển thị khung màu xanh Cyan `[ID: 1]`, `[ID: 2]`.
-   - Nếu chưa chọn ai, Drone giữ trạng thái `STANDBY / HOVER` bay tại chỗ an toàn.
-3. **Khóa Mục Tiêu & Bám Đuổi (Target Locking & Tracking)**:
-   - Khi người dùng click chọn ID $K$, mục tiêu chuyển sang khung màu **Xanh Lá `LOCKED ID: K`**.
-   - `vehicle_yaw_search.py` nhận sai số của đúng đối tượng $K$ và điều khiển Drone bám sát theo người đó khi người bắt đầu di chuyển sau 60s.
+Tất cả thao tác điều khiển được tích hợp **trên cùng cửa sổ Camera POV**:
+
+| Phím / Thao tác | Chức năng | Chuyển đổi State |
+| :--- | :--- | :--- |
+| **`W` / `S`** | Bay Tiến / Lùi ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
+| **`A` / `D`** | Bay Sang Trái / Phải ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
+| **`R` / `F`** | Bay Lên cao / Hạ xuống ($1.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
+| **`Q` / `E`** | Xoay mũi Trái / Phải ($\pm 0.45\text{ rad/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
+| **`X`** | Phanh dừng khẩn cấp (Hover tại chỗ) | `MANUAL` (Vận tốc = 0) |
+| **Click Chuột trái vào người** | Khóa mục tiêu vừa click (cách chọn chính) | $\rightarrow$ `TRACKING` (Tự động bám) |
+| **Phím số `1`, `2`, `3`, `4`...** | Khóa mục tiêu theo ID nội bộ (không hiển thị trên màn hình) | $\rightarrow$ `TRACKING` (Tự động bám) |
+| **Phím `0` hoặc `SPACE`** | Hủy khóa mục tiêu (Bay treo tại chỗ) | $\rightarrow$ `STANDBY` (Hover) |
+
+---
+
+## 4. Kiến trúc State Machine (`MotionArbiter`)
+
+```
+               [ Click chuột / Phím 1-9 ]
+        +----------------------------------------+
+        |                                        |
+        v                                        |
++---------------+     Phím lái (W/A/S/D...)     +---------------+
+|   TRACKING    | --------------------------->  |    MANUAL     |
++---------------+                               +---------------+
+  |           ^                                   ^           |
+  | (0/SPACE  | (Click / 1-9)                     |           |
+  |  Timeout) |                                   |           |
+  v           |                                   | (W/A/S/D) |
++---------------+                                 |           |
+|    STANDBY    | --------------------------------+           |
++---------------+ --------------------------------------------+
+```
+
+* **Zero-Latency Manual Override**: Khi drone đang tự động bay bám mục tiêu (`TRACKING`), ngay khi bạn bấm bất kỳ phím lái nào (`W/A/S/D`), quyền điều khiển sẽ chuyển ngay sang `MANUAL` trong vòng $< 10\text{ ms}$.
+* **Failsafe Watchdog**: Nếu mục tiêu bị mất dấu quá $4.0\text{s}$, drone tự động chuyển sang `STANDBY` (Hover an toàn tại chỗ) chứ không tự ý bay mất kiểm soát.
