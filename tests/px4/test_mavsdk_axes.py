@@ -13,7 +13,12 @@ async def main():
     print("=" * 70)
 
     # 1. Launch PX4 SITL
-    print("[1/5] Launching PX4 SITL headless + Gazebo Harmonic...")
+    # Kill stale PX4/Gazebo instances first: a leftover sim halves the CPU
+    # and collapses the real-time factor, which shows up as tiny displacements.
+    print("[1/5] Cleaning stale sims & launching PX4 SITL headless + Gazebo Harmonic...")
+    subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
+    subprocess.run("pkill -9 -f 'gz si[m]' 2>/dev/null || true", shell=True)
+    time.sleep(1.0)
     env = os.environ.copy()
     env["HEADLESS"] = "1"
     px4_proc = subprocess.Popen(
@@ -25,6 +30,18 @@ async def main():
         preexec_fn=os.setsid
     )
 
+    try:
+        await run_axis_tests()
+    finally:
+        # Never leak the sim: an orphaned Gazebo poisons the next test run
+        # (two competing sims collapse the real-time factor).
+        try:
+            os.killpg(os.getpgid(px4_proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+async def run_axis_tests():
     drone = System()
     print("[2/5] Connecting to PX4 via MAVSDK on udp://:14540...")
     await drone.connect(system_address="udp://:14540")
@@ -181,7 +198,6 @@ async def main():
     await drone.action.land()
     await asyncio.sleep(3.0)
 
-    os.killpg(os.getpgid(px4_proc.pid), signal.SIGTERM)
     print("\n" + "=" * 70)
     print("   ALL 4 PHYSICAL AXES PASSED 100%: PERFECT CONGRUENCE WITH ARDUPILOT   ")
     print("=" * 70)
