@@ -2,7 +2,7 @@
 <sdf version="1.9">
   <model name="gimbal_small_3d">
     <pose>0 0 0.18 0 0 0</pose>
-    <link name="base_link">
+    <link name="gimbal_base_link">
       <inertial>
         <mass>0.2</mass>
         <inertia>
@@ -26,14 +26,6 @@
           <specular>0.01 0.01 0.01 1.0</specular>
         </material>
       </visual>
-      <collision name="base_collision">
-        <pose>0.01 0.075 -0.025 0 0 0</pose>
-        <geometry>
-          <box>
-            <size>0.1 0.05 0.15</size>
-          </box>
-        </geometry>
-      </collision>
     </link>
 
     <link name="yaw_link">
@@ -60,16 +52,9 @@
           <specular>0.01 0.01 0.01 1.0</specular>
         </material>
       </visual>
-      <collision name="yaw_collision">
-        <geometry>
-          <mesh>
-            <uri>model://gimbal_small_3d/meshes/yaw_arm.dae</uri>
-          </mesh>
-        </geometry>
-      </collision>
     </link>
     <joint name="yaw_joint" type="revolute">
-      <parent>base_link</parent>
+      <parent>gimbal_base_link</parent>
       <child>yaw_link</child>
       <axis>
         <xyz>0 1 0</xyz>
@@ -108,13 +93,6 @@
           <specular>0.01 0.01 0.01 1.0</specular>
         </material>
       </visual>
-      <collision name="roll_collision">
-        <geometry>
-          <mesh>
-            <uri>model://gimbal_small_3d/meshes/roll_arm.dae</uri>
-          </mesh>
-        </geometry>
-      </collision>
     </link>
     <joint name="roll_joint" type="revolute">
       <parent>yaw_link</parent>
@@ -157,14 +135,6 @@
           <specular>0.1 0.1 0.1 1.0</specular>
         </material>
       </visual>
-      <collision name="pitch_collision">
-        <pose>0 0 0 0 0 0</pose>
-        <geometry>
-          <mesh>
-            <uri>model://gimbal_small_3d/meshes/camera_enclosure.dae</uri>
-          </mesh>
-        </geometry>
-      </collision>
       <visual name="camera_visual">
         <pose>0 0 0.02 0 0 0</pose>
         <geometry>
@@ -180,146 +150,7 @@
         </material>
       </visual>
 
-      <!-- 4 Visual Camera FOV Frustum Rays (Visible in Gazebo GUI, hidden from camera) -->
-      <visual name="fov_ray_top_left">
-        <pose>-1.015 -0.76 2.25 0.334 -0.443 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.005</radius>
-            <length>5.16</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 0.8 1.0 0.6</ambient>
-          <diffuse>0.0 0.8 1.0 0.6</diffuse>
-          <emissive>0.0 0.7 1.0 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <visual name="fov_ray_top_right">
-        <pose>1.015 -0.76 2.25 0.334 0.443 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.005</radius>
-            <length>5.16</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 0.8 1.0 0.6</ambient>
-          <diffuse>0.0 0.8 1.0 0.6</diffuse>
-          <emissive>0.0 0.7 1.0 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <visual name="fov_ray_bottom_left">
-        <pose>-1.015 0.76 2.25 -0.334 -0.443 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.005</radius>
-            <length>5.16</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 0.8 1.0 0.6</ambient>
-          <diffuse>0.0 0.8 1.0 0.6</diffuse>
-          <emissive>0.0 0.7 1.0 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <visual name="fov_ray_bottom_right">
-        <pose>1.015 0.76 2.25 -0.334 0.443 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.005</radius>
-            <length>5.16</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 0.8 1.0 0.6</ambient>
-          <diffuse>0.0 0.8 1.0 0.6</diffuse>
-          <emissive>0.0 0.7 1.0 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <!-- Ground Footprint Boundary Box (Visible in Gazebo GUI, hidden from camera) -->
-      <visual name="fov_boundary_top">
-        <pose>0 -1.52 4.5 0 1.5708 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.006</radius>
-            <length>4.06</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 1.0 0.8 0.7</ambient>
-          <diffuse>0.0 1.0 0.8 0.7</diffuse>
-          <emissive>0.0 0.9 0.8 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <visual name="fov_boundary_bottom">
-        <pose>0 1.52 4.5 0 1.5708 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.006</radius>
-            <length>4.06</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 1.0 0.8 0.7</ambient>
-          <diffuse>0.0 1.0 0.8 0.7</diffuse>
-          <emissive>0.0 0.9 0.8 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <visual name="fov_boundary_left">
-        <pose>-2.03 0 4.5 1.5708 0 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.006</radius>
-            <length>3.04</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 1.0 0.8 0.7</ambient>
-          <diffuse>0.0 1.0 0.8 0.7</diffuse>
-          <emissive>0.0 0.9 0.8 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-
-      <visual name="fov_boundary_right">
-        <pose>2.03 0 4.5 1.5708 0 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.006</radius>
-            <length>3.04</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <ambient>0.0 1.0 0.8 0.7</ambient>
-          <diffuse>0.0 1.0 0.8 0.7</diffuse>
-          <emissive>0.0 0.9 0.8 1.0</emissive>
-        </material>
-        <visibility_flags>2</visibility_flags>
-      </visual>
-      <collision name="camera_collision">
-        <pose>0 0 0.02 0 0 0</pose>
-        <geometry>
-          <cylinder>
-            <radius>0.025</radius>
-            <length>0.050</length>
-          </cylinder>
-        </geometry>
-      </collision>
       <sensor name="camera" type="camera">
-        <gz_frame_id>pitch_link</gz_frame_id>
         <pose>0 0 0 -1.57 -1.57 0</pose>
         <camera>
           <horizontal_fov>2.0</horizontal_fov>
@@ -331,26 +162,10 @@
             <near>0.05</near>
             <far>15000</far>
           </clip>
-          <visibility_mask>1</visibility_mask>
         </camera>
         <always_on>1</always_on>
         <update_rate>10</update_rate>
         <visualize>1</visualize>
-
-        <plugin filename="CameraZoomPlugin"
-            name="CameraZoomPlugin">
-          <max_zoom>125.0</max_zoom>
-          <slew_rate>0.42514285714</slew_rate>
-        </plugin>
-        
-        <plugin name="GstCameraPlugin"
-            filename="GstCameraPlugin">
-          <udp_host>127.0.0.1</udp_host>
-          <udp_port>5600</udp_port>
-          <use_basic_pipeline>true</use_basic_pipeline>
-          <use_cuda>false</use_cuda>
-        </plugin>
-
       </sensor>
     </link>
     <joint name="pitch_joint" type="revolute">

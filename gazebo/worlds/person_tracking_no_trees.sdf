@@ -1,13 +1,15 @@
 <?xml version="1.0" ?>
 <sdf version="1.9">
-  <world name="person_tracking_path">
+  <world name="person_tracking_no_trees">
     <!-- 1. Cấu hình Physics: max_step_size 1ms, real_time_factor 1.0 -->
-    <physics name="1ms" type="ignore">
-      <max_step_size>0.001</max_step_size>
+    <physics type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_update_rate>250</real_time_update_rate>
       <real_time_factor>1.0</real_time_factor>
     </physics>
 
     <!-- 2. Các Plugin gz-sim cốt lõi -->
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
     <plugin filename="gz-sim-physics-system"
       name="gz::sim::systems::Physics">
     </plugin>
@@ -24,9 +26,17 @@
     <plugin filename="gz-sim-imu-system"
       name="gz::sim::systems::Imu">
     </plugin>
+    <!-- Required by PX4 GZBridge for the x500 barometer/EKF preflight check. -->
+    <plugin filename="gz-sim-air-pressure-system"
+      name="gz::sim::systems::AirPressure">
+    </plugin>
     <plugin filename="gz-sim-navsat-system"
       name="gz::sim::systems::NavSat">
     </plugin>
+
+    <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic"/>
 
     <!-- 3. Scene & Sky & Ánh sáng môi trường -->
     <scene>
@@ -41,14 +51,14 @@
 
     <!-- 4. Toạ độ địa lý (GPS/NavSat cho ArduPilot SITL) -->
     <spherical_coordinates>
-      <latitude_deg>-35.363262</latitude_deg>
-      <longitude_deg>149.165237</longitude_deg>
-      <elevation>584</elevation>
+      <latitude_deg>47.397742</latitude_deg>
+      <longitude_deg>8.545594</longitude_deg>
+      <elevation>488.0</elevation>
       <heading_deg>0</heading_deg>
       <surface_model>EARTH_WGS84</surface_model>
     </spherical_coordinates>
 
-    <!-- 5. Nguồn sáng mặt trời (Directional Sun Light - đủ sáng cho YOLO Camera) -->
+    <!-- 5. Nguồn sáng mặt trời (Directional Sun Light) -->
     <light type="directional" name="sun">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 50 0 0 0</pose>
@@ -116,7 +126,7 @@
       </link>
     </model>
 
-    <!-- 7. Mặt đất bãi cỏ rộng (Ground Grass Plane >= 120x120m) -->
+    <!-- 7. Mặt đất bãi cỏ rộng (Ground Grass Plane >= 140x140m) -->
     <model name="ground_grass">
       <static>true</static>
       <link name="ground_link">
@@ -152,16 +162,16 @@
       </link>
     </model>
 
-    <!-- 8. Con đường / Vỉa hè bê tông dạng Zic-Zac trong công viên (Park Walkway) -->
+    <!-- 8. Mạng lưới đường đi / vỉa hè công viên (Park Walkway Network với Ngã tư & Zic-Zac) -->
     <model name="park_walkway">
       <static>true</static>
       <link name="walkway_link">
-        <!-- Đoạn 1: từ (0, 5) đến (10, 5) -->
+        <!-- Đường chính Đông - Tây: từ (-2.0, 5.0) đến (10.0, 5.0) -->
         <visual name="segment_1_visual">
           <pose>5.0 5.0 0.015 0 0 0</pose>
           <geometry>
             <box>
-              <size>12.5 2.5 0.03</size>
+              <size>14.0 2.5 0.03</size>
             </box>
           </geometry>
           <material>
@@ -174,7 +184,30 @@
           <pose>5.0 5.0 0.015 0 0 0</pose>
           <geometry>
             <box>
-              <size>12.5 2.5 0.03</size>
+              <size>14.0 2.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đường cắt ngang Bắc - Nam tại X = 6.0: từ (6.0, -3.0) đến (6.0, 11.0) -->
+        <visual name="cross_segment_visual">
+          <pose>6.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="cross_segment_col">
+          <pose>6.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
             </box>
           </geometry>
         </collision>
@@ -296,158 +329,125 @@
       </link>
     </model>
 
-    <!-- 9. Drone Iris với Gimbal + Camera (Sẵn sàng bay test YOLO + Tracking) -->
-    <include>
-      <uri>model://iris_with_gimbal</uri>
-      <pose degrees="true">-2.0 5.0 0.35 0 0 0</pose>
-    </include>
+    
 
-    <!-- 10. Người đi bộ (Actor: walking_person) có skeleton animation đi bộ thực -->
+    <!-- ================================================================= -->
+    <!-- 10. TARGET CHÍNH: Person A (walking_person)                       -->
+    <!-- Đặc tính: Áo xanh dương, Quần tối màu, Không mũ, Không balo       -->
+    <!-- ================================================================= -->
     <actor name="walking_person">
       <skin>
-        <filename>https://fuel.gazebosim.org/1.0/mingfei/models/actor/1/files/meshes/walk.dae</filename>
+        <filename>model://pedestrian_blue/meshes/walk.dae</filename>
         <scale>1.0</scale>
       </skin>
-
       <animation name="walk">
-        <filename>https://fuel.gazebosim.org/1.0/mingfei/models/actor/1/files/meshes/walk.dae</filename>
+        <filename>model://pedestrian_blue/meshes/walk.dae</filename>
         <scale>1.0</scale>
         <interpolate_x>true</interpolate_x>
       </animation>
-
       <script>
         <loop>true</loop>
         <delay_start>30.0</delay_start>
         <auto_start>true</auto_start>
-
-        <!-- Quỹ đạo di chuyển (Trajectory) khớp chính xác 100% với đường đi vỉa hè -->
         <trajectory id="0" type="walk">
-          <!-- === LƯỢT ĐI (FORWARD): WP0 -> WP1 -> WP2 -> WP3 -> WP4 -> WP5 -> WP6 === -->
-          <!-- 1. Bắt đầu tại WP0 (0, 5), hướng Đông (yaw = 0.0) -->
+          <!-- LƯỢT ĐI: (0, 5) -> (10, 5) -> (10, 15) -> (20, 15) -> (20, 5) -> (30, 5) -> (30, 15) -->
           <waypoint>
             <time>0.0</time>
             <pose>0.0 5.0 0.8891414 0 0 0.0</pose>
           </waypoint>
-          <!-- 2. Đến WP1 (10, 5), kết thúc đoạn 1 -->
           <waypoint>
             <time>9.0</time>
             <pose>10.0 5.0 0.8891414 0 0 0.0</pose>
           </waypoint>
-          <!-- 3. Rẽ trái 90 độ tại WP1 để hướng Bắc (yaw = 1.5708) -->
           <waypoint>
             <time>10.0</time>
             <pose>10.0 5.0 0.8891414 0 0 1.5708</pose>
           </waypoint>
-          <!-- 4. Đến WP2 (10, 15), kết thúc đoạn 2 -->
           <waypoint>
             <time>19.0</time>
             <pose>10.0 15.0 0.8891414 0 0 1.5708</pose>
           </waypoint>
-          <!-- 5. Rẽ phải 90 độ tại WP2 để hướng Đông (yaw = 0.0) -->
           <waypoint>
             <time>20.0</time>
             <pose>10.0 15.0 0.8891414 0 0 0.0</pose>
           </waypoint>
-          <!-- 6. Đến WP3 (20, 15), kết thúc đoạn 3 -->
           <waypoint>
             <time>29.0</time>
             <pose>20.0 15.0 0.8891414 0 0 0.0</pose>
           </waypoint>
-          <!-- 7. Rẽ phải 90 độ tại WP3 để hướng Nam (yaw = -1.5708) -->
           <waypoint>
             <time>30.0</time>
             <pose>20.0 15.0 0.8891414 0 0 -1.5708</pose>
           </waypoint>
-          <!-- 8. Đến WP4 (20, 5), kết thúc đoạn 4 -->
           <waypoint>
             <time>39.0</time>
             <pose>20.0 5.0 0.8891414 0 0 -1.5708</pose>
           </waypoint>
-          <!-- 9. Rẽ trái 90 độ tại WP4 để hướng Đông (yaw = 0.0) -->
           <waypoint>
             <time>40.0</time>
             <pose>20.0 5.0 0.8891414 0 0 0.0</pose>
           </waypoint>
-          <!-- 10. Đến WP5 (30, 5), kết thúc đoạn 5 -->
           <waypoint>
             <time>49.0</time>
             <pose>30.0 5.0 0.8891414 0 0 0.0</pose>
           </waypoint>
-          <!-- 11. Rẽ trái 90 độ tại WP5 để hướng Bắc (yaw = 1.5708) -->
           <waypoint>
             <time>50.0</time>
             <pose>30.0 5.0 0.8891414 0 0 1.5708</pose>
           </waypoint>
-          <!-- 12. Đến WP6 (30, 15), điểm cuối lượt đi -->
           <waypoint>
             <time>59.0</time>
             <pose>30.0 15.0 0.8891414 0 0 1.5708</pose>
           </waypoint>
-
-          <!-- === QUAY ĐẦU TẠI WP6 ĐỂ ĐI VỀ (U-TURN) === -->
-          <!-- 13. Quay 180 độ tại WP6 (30, 15) sang hướng Nam (yaw = -1.5708) -->
           <waypoint>
             <time>61.0</time>
             <pose>30.0 15.0 0.8891414 0 0 -1.5708</pose>
           </waypoint>
-
-          <!-- === LƯỢT VỀ (RETURN): WP6 -> WP5 -> WP4 -> WP3 -> WP2 -> WP1 -> WP0 === -->
-          <!-- 14. Về lại WP5 (30, 5) -->
+          <!-- LƯỢT VỀ -->
           <waypoint>
             <time>70.0</time>
             <pose>30.0 5.0 0.8891414 0 0 -1.5708</pose>
           </waypoint>
-          <!-- 15. Rẽ phải 90 độ tại WP5 để hướng Tây (yaw = -3.14159) -->
           <waypoint>
             <time>71.0</time>
             <pose>30.0 5.0 0.8891414 0 0 -3.14159</pose>
           </waypoint>
-          <!-- 16. Về lại WP4 (20, 5) -->
           <waypoint>
             <time>80.0</time>
             <pose>20.0 5.0 0.8891414 0 0 -3.14159</pose>
           </waypoint>
-          <!-- 17. Rẽ phải 90 độ tại WP4 để hướng Bắc (yaw = -4.71239) -->
           <waypoint>
             <time>81.0</time>
             <pose>20.0 5.0 0.8891414 0 0 -4.71239</pose>
           </waypoint>
-          <!-- 18. Về lại WP3 (20, 15) -->
           <waypoint>
             <time>90.0</time>
             <pose>20.0 15.0 0.8891414 0 0 -4.71239</pose>
           </waypoint>
-          <!-- 19. Rẽ trái 90 độ tại WP3 để hướng Tây (yaw = -3.14159) -->
           <waypoint>
             <time>91.0</time>
             <pose>20.0 15.0 0.8891414 0 0 -3.14159</pose>
           </waypoint>
-          <!-- 20. Về lại WP2 (10, 15) -->
           <waypoint>
             <time>100.0</time>
             <pose>10.0 15.0 0.8891414 0 0 -3.14159</pose>
           </waypoint>
-          <!-- 21. Rẽ trái 90 độ tại WP2 để hướng Nam (yaw = -1.5708) -->
           <waypoint>
             <time>101.0</time>
             <pose>10.0 15.0 0.8891414 0 0 -1.5708</pose>
           </waypoint>
-          <!-- 22. Về lại WP1 (10, 5) -->
           <waypoint>
             <time>110.0</time>
             <pose>10.0 5.0 0.8891414 0 0 -1.5708</pose>
           </waypoint>
-          <!-- 23. Rẽ phải 90 độ tại WP1 để hướng Tây (yaw = -3.14159) -->
           <waypoint>
             <time>111.0</time>
             <pose>10.0 5.0 0.8891414 0 0 -3.14159</pose>
           </waypoint>
-          <!-- 24. Về đến điểm xuất phát WP0 (0, 5) -->
           <waypoint>
             <time>120.0</time>
             <pose>0.0 5.0 0.8891414 0 0 -3.14159</pose>
           </waypoint>
-          <!-- 25. Quay lại hướng Đông (yaw = 0.0) để bắt đầu vòng lặp tiếp theo -->
           <waypoint>
             <time>121.0</time>
             <pose>0.0 5.0 0.8891414 0 0 0.0</pose>
@@ -455,6 +455,8 @@
         </trajectory>
       </script>
     </actor>
+
+    
 
   </world>
 </sdf>
