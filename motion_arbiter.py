@@ -6,6 +6,8 @@ Unified Flight Control & State Machine Node for UAV Tracking & Teleop.
 Features:
 - Automatic ARM & Takeoff to 4.0m on startup with retry until EKF2 is fully initialized.
 - Single MAVLink connection point (udpin:0.0.0.0:14540).
+- Tracks the real PX4 armed state; TAKEOFF after an uncommanded land/disarm
+  clears stale flags and re-arms instead of being ignored as a duplicate.
 - State Machine: [MANUAL, TRACKING, STANDBY].
 - Interactive Key Actions:
     * Key [TAB] / [T] -> Takeoff to 4.0m
@@ -24,6 +26,7 @@ from typing import Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, Twist
+from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Int32, String
 from pymavlink import mavutil
 
@@ -31,6 +34,7 @@ from pymavlink import mavutil
 STATE_MANUAL = 'MANUAL'
 STATE_TRACKING = 'TRACKING'
 STATE_STANDBY = 'STANDBY'
+STATE_MANUAL_GOTO = 'MANUAL_GOTO'
 
 # PX4 Custom Modes
 PX4_CUSTOM_MAIN_MODE_MANUAL = 1
@@ -70,6 +74,9 @@ class MotionArbiter(Node):
         self.declare_parameter('min_forward_speed', -1.2)
         self.declare_parameter('tree_clearance_margin', 1.8)
         self.declare_parameter('teleop_timeout', 0.5)
+        self.declare_parameter('goto_altitude', 4.0)
+        self.declare_parameter('bottom_backup_timeout', 7.0)
+        self.declare_parameter('bottom_recovery_timeout', 10.0)
 
         gp = self.get_parameter
         self.mavlink_uri = gp('mavlink').value
@@ -90,6 +97,9 @@ class MotionArbiter(Node):
         self.min_forward_speed = float(gp('min_forward_speed').value)
         self.tree_clearance_margin = float(gp('tree_clearance_margin').value)
         self.teleop_timeout = float(gp('teleop_timeout').value)
+        self.goto_altitude = float(gp('goto_altitude').value)
+        self.bottom_backup_timeout = float(gp('bottom_backup_timeout').value)
+        self.bottom_recovery_timeout = float(gp('bottom_recovery_timeout').value)
 
         # State Machine (Default: TRACKING)
         self.current_state = STATE_TRACKING
@@ -113,6 +123,14 @@ class MotionArbiter(Node):
         self.last_seen_y: float = 0.0
         self.last_tracking_substate: Optional[str] = None
         self._last_vx: float = 0.0
+        self.goto_lat: Optional[float] = None
+        self.goto_lon: Optional[float] = None
+        self.goto_alt: float = self.goto_altitude
+        self.goto_resume_state: str = STATE_STANDBY
+        self.goto_resume_target_id: Optional[int] = None
+        self.current_lat: Optional[float] = None
+        self.current_lon: Optional[float] = None
+        self.current_alt: Optional[float] = None
 
         # Teleop variables
         self.teleop_vx: float = 0.0
@@ -120,6 +138,20 @@ class MotionArbiter(Node):
         self.teleop_vz: float = 0.0
         self.teleop_yaw_rate: float = 0.0
         self.last_teleop_cmd_time: float = 0.0
+
+        # Real vehicle state, kept fresh by the RX monitor thread. The
+        # internal is_airborne flag is only bookkeeping; PX4 can land and
+        # disarm underneath us at any time (offboard-loss failsafe, QGC
+        # command, crash). vehicle_armed is the ground truth that keeps the
+        # two in sync.
+        self.vehicle_armed: Optional[bool] = None
+
+        # Single-reader MAVLink RX cache. mavutil's recv_match(type=...)
+        # DISCARDS non-matching messages, so concurrent callers used to steal
+        # COMMAND_ACK / HEARTBEAT from each other. One monitor thread now owns
+        # the socket reads and caches the latest message per type.
+        self.rx_lock = threading.Lock()
+        self.rx_latest = {}
 
         # Timing & locks
         self.last_tick_time = time.time()
@@ -130,7 +162,9 @@ class MotionArbiter(Node):
         self.create_subscription(Twist, '/teleop/cmd_vel', self.on_teleop_cmd, 10)
         self.create_subscription(Int32, '/tracking/select_target', self.on_target_selected, 10)
         self.create_subscription(String, '/teleop/flight_action', self.on_flight_action, 10)
+        self.create_subscription(Point, '/tracking/goto_gps', self.on_goto_gps, 10)
         self.pub_state = self.create_publisher(String, '/tracking/motion_state', 10)
+        self.pub_gps = self.create_publisher(NavSatFix, '/tracking/gps', 10)
 
         # Establish single MAVLink connection to PX4
         self.master = None
@@ -173,16 +207,121 @@ class MotionArbiter(Node):
             mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
         )
 
+        threading.Thread(
+            target=self._rx_monitor_loop, daemon=True, name='mavlink-rx-monitor'
+        ).start()
+        try:
+            self._apply_sitl_failsafe_tolerances()
+        except Exception as exc:  # noqa: BLE001 - never block flight control on a param tweak
+            self.get_logger().warning(f'[PARAM] COM_OF_LOSS_T tuning skipped: {exc}')
+
+    def _rx_monitor_loop(self):
+        """Single consumer of the MAVLink RX stream.
+
+        mavutil's recv_match(type=...) silently DISCARDS every non-matching
+        message, so any second concurrent caller steals messages from the
+        first (COMMAND_ACK during takeoff being the costly example). All RX
+        goes through this thread; everyone else reads self.rx_latest.
+        """
+        while True:
+            m = self.master
+            if m is None:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = m.recv_match(blocking=True, timeout=0.2)
+            except Exception:  # noqa: BLE001
+                time.sleep(0.1)
+                continue
+            if msg is None:
+                continue
+            mtype = msg.get_type()
+            with self.rx_lock:
+                self.rx_latest[mtype] = (time.time(), msg)
+            if mtype == 'HEARTBEAT':
+                self.vehicle_armed = bool(
+                    int(msg.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
+
+    def _rx_get(self, mtype, max_age=None):
+        """Return the latest cached message of mtype (None if absent/stale)."""
+        with self.rx_lock:
+            entry = self.rx_latest.get(mtype)
+        if entry is None:
+            return None
+        ts, msg = entry
+        if max_age is not None and (time.time() - ts) > max_age:
+            return None
+        return msg
+
+    def _apply_sitl_failsafe_tolerances(self):
+        """Relax the OFFBOARD-loss timeout for SITL running on a loaded host.
+
+        Field logs (ulog 2026-08-25 08_06_18) show the 10 Hz setpoint stream
+        stalling ~2.4 s roughly every 30 s while Gazebo/YOLO/QGC compete for
+        CPU; against the 1 s default each stall tripped an offboard-loss
+        failsafe whose fallback descent cost ~1 m of altitude until the drone
+        eventually touched down. 5 s keeps genuine stream deaths failing safe
+        while absorbing load hiccups.
+
+        !!! SITL-ONLY TUNING — DO NOT FLY OUTDOORS WITH THIS VALUE !!!
+        A 5 s failsafe delay is a desktop-load compromise. Before any real
+        flight, revisit this number with the safety pilot: real vehicles need
+        a much shorter offboard-loss reaction (PX4 default 1.0 s or shorter).
+        """
+        target_param = 'COM_OF_LOSS_T'
+        desired = 5.0
+        m = self.master
+        if m is None:
+            return
+        with self.rx_lock:
+            baseline = self.rx_latest.get('PARAM_VALUE', (0.0, None))[0]
+        m.mav.param_set_send(
+            m.target_system, m.target_component,
+            target_param.encode('ascii'), desired,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            pv = self._rx_get('PARAM_VALUE', max_age=1.0)
+            if pv is not None and str(pv.param_id).strip('\x00') == target_param \
+                    and float(pv.param_value) != 0.0:
+                value = float(pv.param_value)
+                if abs(value - desired) < 1e-3:
+                    self.get_logger().info(
+                        f'[PARAM] {target_param}={value:.1f}s '
+                        '(SITL offboard-loss stall tolerance applied)'
+                    )
+                else:
+                    self.get_logger().warning(
+                        f'[PARAM] {target_param} readback {value}, expected {desired}'
+                    )
+                return
+            time.sleep(0.05)
+        self.get_logger().warning(f'[PARAM] No confirmation for {target_param}={desired}')
+
     def on_flight_action(self, msg: String):
         """Handle interactive flight actions from HUD ([TAB]=TAKEOFF, [P]=LAND)."""
         action = msg.data.strip().upper()
         if action == "TAKEOFF":
-            if not self.is_taking_off and not self.is_airborne:
-                self.is_taking_off = True
-                self.get_logger().info(f"[ACTION] Key TAB received -> Executing ARM & TAKEOFF to {self.takeoff_alt:.1f}m!")
-                threading.Thread(target=self._execute_takeoff, daemon=True).start()
-            elif self.is_airborne:
+            if self.is_taking_off:
+                self.get_logger().info("[ACTION] Takeoff already in progress, ignoring duplicate TAKEOFF.")
+                return
+            if self.is_airborne and self.vehicle_armed is not False:
                 self.get_logger().info("[ACTION] Drone is already airborne, ignoring duplicate TAKEOFF.")
+                return
+            if self.is_airborne and getattr(self, 'vehicle_armed', None) is False:
+                # PX4 landed and disarmed on its own (offboard-loss failsafe,
+                # QGC command...). is_airborne was only bookkeeping; the old
+                # code swallowed every TAKEOFF forever in this situation.
+                self.get_logger().warning(
+                    "[ACTION] PX4 reports DISARMED while arbiter believed airborne "
+                    "-> clearing stale state and re-arming for takeoff."
+                )
+                self.is_airborne = False
+            self.is_taking_off = True
+            self.get_logger().info(f"[ACTION] Key TAB received -> Executing ARM & TAKEOFF to {self.takeoff_alt:.1f}m!")
+            threading.Thread(target=self._execute_takeoff, daemon=True).start()
         elif action == "LAND":
             self.get_logger().info("[ACTION] Key P received -> Executing LAND command!")
             threading.Thread(target=self.land_px4, daemon=True).start()
@@ -209,7 +348,7 @@ class MotionArbiter(Node):
         if m is not None:
             t0 = time.time()
             while time.time() - t0 < 30.0:
-                msg = m.recv_match(type=['GPS_RAW_INT', 'GLOBAL_POSITION_INT'], blocking=True, timeout=1.0)
+                msg = self._rx_get('GPS_RAW_INT') or self._rx_get('GLOBAL_POSITION_INT')
                 if msg is not None and getattr(msg, 'lat', 0) != 0:
                     gps_ready = True
                     self.get_logger().info(
@@ -231,21 +370,30 @@ class MotionArbiter(Node):
         if m is None:
             return False
         values = list(params) + [0.0] * (7 - len(params))
+        # Only an ACK that arrives after this send counts; the RX monitor may
+        # still hold the previous command's ACK in its cache.
+        with self.rx_lock:
+            baseline = self.rx_latest.get('COMMAND_ACK', (0.0, None))[0]
         m.mav.command_long_send(
             m.target_system, m.target_component, command, 0, *values[:7]
         )
         deadline = time.time() + timeout
         while time.time() < deadline:
-            ack = m.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.25)
-            if ack is None or ack.command != command:
-                continue
-            result = int(ack.result)
-            if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                return True
-            self.get_logger().warning(
-                f'[MAVLINK] Command {command} rejected (result={result})'
-            )
-            return False
+            with self.rx_lock:
+                entry = self.rx_latest.get('COMMAND_ACK')
+            if entry is not None and entry[0] > baseline:
+                ack = entry[1]
+                if int(ack.command) != command:
+                    time.sleep(0.02)
+                    continue
+                result = int(ack.result)
+                if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    return True
+                self.get_logger().warning(
+                    f'[MAVLINK] Command {command} rejected (result={result})'
+                )
+                return False
+            time.sleep(0.02)
         self.get_logger().warning(f'[MAVLINK] No ACK for command {command}')
         return False
 
@@ -282,9 +430,10 @@ class MotionArbiter(Node):
         while m is not None and time.time() < deadline:
             if keep_offboard_alive:
                 self._send_offboard_velocity(0.0, 0.0, 0.0)
-            hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=0.10)
+            hb = self._rx_get('HEARTBEAT', max_age=1.5)
             if hb is not None and (int(hb.base_mode) & armed_flag):
                 return True
+            time.sleep(0.05)
         return False
 
     def _wait_offboard(self, timeout: float = 4.0) -> bool:
@@ -293,8 +442,9 @@ class MotionArbiter(Node):
         deadline = time.time() + timeout
         while m is not None and time.time() < deadline:
             self._send_offboard_velocity(0.0, 0.0, 0.0)
-            hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=0.10)
+            hb = self._rx_get('HEARTBEAT', max_age=1.5)
             if hb is None:
+                time.sleep(0.05)
                 continue
             custom_mode_enabled = (
                 int(hb.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
@@ -302,6 +452,7 @@ class MotionArbiter(Node):
             main_mode = (int(hb.custom_mode) >> 16) & 0xFF
             if custom_mode_enabled and main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD:
                 return True
+            time.sleep(0.05)
         return False
 
     def _get_local_position(self, timeout: float = 5.0):
@@ -309,11 +460,12 @@ class MotionArbiter(Node):
         m = self.master
         deadline = time.time() + timeout
         while m is not None and time.time() < deadline:
-            msg = m.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=0.25)
-            if msg is None:
-                continue
-            if all(math.isfinite(float(getattr(msg, axis))) for axis in ('x', 'y', 'z')):
+            msg = self._rx_get('LOCAL_POSITION_NED', max_age=0.5)
+            if msg is not None and all(
+                math.isfinite(float(getattr(msg, axis))) for axis in ('x', 'y', 'z')
+            ):
                 return msg
+            time.sleep(0.05)
         return None
 
     def _execute_takeoff(self):
@@ -374,7 +526,8 @@ class MotionArbiter(Node):
         progress_deadline = time.monotonic() + 30.0
         absolute_deadline = time.monotonic() + max(90.0, self.takeoff_alt * 25.0)
         while time.monotonic() < absolute_deadline and time.monotonic() < progress_deadline:
-            msg = m.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=0.10)
+            msg = self._rx_get('LOCAL_POSITION_NED', max_age=0.4)
+            time.sleep(0.05)
             altitude = None
             if msg is not None and math.isfinite(float(msg.z)):
                 altitude = ground_z - float(msg.z)
@@ -433,7 +586,12 @@ class MotionArbiter(Node):
         self.get_logger().info(log_str)
 
         msg = String()
-        msg.data = f"{new_state}:{target_id if target_id is not None else -1}"
+        # Third field: real vehicle armed state, so the HUD can tell
+        # "hovering" apart from "sitting on the ground after a failsafe".
+        # Lightweight state-machine test doubles from the PX4 suite predate
+        # the vehicle telemetry cache; treat an absent cache as armed.
+        armed_status = 'DISARMED' if getattr(self, 'vehicle_armed', None) is False else 'ARMED'
+        msg.data = f"{new_state}:{target_id if target_id is not None else -1}:{armed_status}"
         if self.pub_state is not None:
             self.pub_state.publish(msg)
 
@@ -471,6 +629,27 @@ class MotionArbiter(Node):
             self.set_state(STATE_TRACKING, trigger='click_or_key_lock', target_id=target_id)
         else:
             self.set_state(STATE_STANDBY, trigger='key_standby', target_id=None)
+
+    def on_goto_gps(self, msg: Point):
+        """Accept a WGS84 position setpoint from the HUD minimap."""
+        if not self.is_airborne or self.is_taking_off:
+            self.get_logger().warning(
+                '[GOTO] Ignoring minimap position until takeoff is complete')
+            return
+        lat, lon = float(msg.x), float(msg.y)
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            self.get_logger().warning('[GOTO] Ignoring non-finite GPS setpoint')
+            return
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            self.get_logger().warning('[GOTO] Ignoring out-of-range GPS setpoint')
+            return
+        self.goto_lat = lat
+        self.goto_lon = lon
+        self.goto_alt = float(msg.z) if math.isfinite(float(msg.z)) and float(msg.z) > 0.5 else self.goto_altitude
+        self.goto_resume_state = self.current_state if self.current_state != STATE_MANUAL_GOTO else STATE_STANDBY
+        self.goto_resume_target_id = self.active_target_id if self.goto_resume_state == STATE_TRACKING else None
+        self.set_state(STATE_MANUAL_GOTO, trigger='hud_minimap_click', target_id=None)
+        self.get_logger().info(f'[GOTO] Position setpoint lat={lat:.7f}, lon={lon:.7f}, alt={self.goto_alt:.2f}m')
 
     def on_tracking_error(self, msg: Point):
         """Receive pixel error from YOLO / TargetManager."""
@@ -514,19 +693,48 @@ class MotionArbiter(Node):
     # ------------------------------------------------------------------
     def tick(self):
         now = time.time()
-        dt = max(0.01, min(0.20, now - self.last_tick_time))
+        raw_dt = now - self.last_tick_time
+        dt = max(0.01, min(0.20, raw_dt))
         self.last_tick_time = now
+        if raw_dt >= 0.50:
+            # The field incident behind this node's COM_OF_LOSS_T tolerance:
+            # make visible whatever stalls the loop so it can be attributed.
+            self.get_logger().warning(
+                f'[WATCHDOG] Control loop stalled {raw_dt:.2f}s (target 0.10s); '
+                'OFFBOARD stream gaps trigger the PX4 offboard-loss failsafe'
+            )
+        self._update_gps_telemetry()
 
         final_vx = 0.0
         final_vy = 0.0
         final_vz = 0.0
         final_yaw_rate = 0.0
+        dispatch_goto = False
+        goto_reached = False
 
         with self.lock:
             state = self.current_state
             age = (now - self.last_seen) if self.last_seen else 999.0
 
-            if state == STATE_TRACKING and self.acquired_once and age > self.lost_timeout:
+            # Sync bookkeeping with the vehicle PX4 actually reports. Without
+            # this, an uncommanded land+disarm left is_airborne stuck True and
+            # every TAKEOFF was ignored as a "duplicate".
+            if self.is_airborne and getattr(self, 'vehicle_armed', None) is False:
+                self.is_airborne = False
+                self.is_taking_off = False
+                self.get_logger().warning(
+                    '[VEHICLE] PX4 DISARMED detected -> arbiter synced to grounded.'
+                )
+                if self.current_state != STATE_STANDBY:
+                    self.set_state(STATE_STANDBY, trigger='vehicle_disarm_detected', target_id=None)
+                    state = self.current_state
+
+            effective_lost_timeout = (
+                getattr(self, 'bottom_recovery_timeout', self.lost_timeout)
+                if getattr(self, 'last_seen_y', 0.0) > self.deadband_y
+                else self.lost_timeout
+            )
+            if state == STATE_TRACKING and self.acquired_once and age > effective_lost_timeout:
                 self.set_state(STATE_STANDBY, trigger='target_lost_timeout', target_id=None)
                 state = self.current_state
 
@@ -542,13 +750,79 @@ class MotionArbiter(Node):
             elif state == STATE_TRACKING:
                 final_vx, final_vy, final_vz, final_yaw_rate = self.compute_tracking_velocities(now, dt, age)
 
+            elif state == STATE_MANUAL_GOTO:
+                # Freeze the dispatch family for this timer cycle. The state
+                # transition happens only after the position setpoint is sent,
+                # so this cycle can never also publish BODY_NED velocity.
+                dispatch_goto = True
+                goto_reached = self._goto_reached()
+
             elif state == STATE_STANDBY:
                 final_vx, final_vy, final_vz, final_yaw_rate = 0.0, 0.0, 0.0, 0.0
 
         # Dispatch single MAVLink velocity setpoint to PX4 OFFBOARD
         m = self.master
-        if m is not None and self.is_airborne:
-            self._send_offboard_velocity(final_vx, final_vy, final_vz, final_yaw_rate)
+        if m is not None and self.is_airborne and self.vehicle_armed is not False:
+            if dispatch_goto:
+                self._send_goto_position_setpoint()
+            else:
+                self._send_offboard_velocity(final_vx, final_vy, final_vz, final_yaw_rate)
+
+        if dispatch_goto and goto_reached:
+            self.set_state(
+                self.goto_resume_state,
+                trigger='goto_reached',
+                target_id=self.goto_resume_target_id,
+            )
+
+    def _update_gps_telemetry(self):
+        """Publish the latest PX4 global position for the HUD minimap."""
+        m = self.master
+        # The RX monitor owns MAVLink reads; peek at its cache here instead of
+        # recv_match, which would steal messages from the takeoff workers.
+        #
+        # Publish on the ground and during takeoff too: gating on is_airborne
+        # left the HUD minimap empty until the drone lifted off, so the pilot
+        # had no position readout while sitting armed on the pad (and the
+        # minimap home reference was only set mid-flight).
+        if m is None:
+            return
+        msg = self._rx_get('GLOBAL_POSITION_INT', max_age=2.0)
+        if msg is not None:
+            lat = float(getattr(msg, 'lat', 0)) / 1e7
+            lon = float(getattr(msg, 'lon', 0)) / 1e7
+            if lat != 0.0 or lon != 0.0:
+                self.current_lat = lat
+                self.current_lon = lon
+                self.current_alt = float(getattr(msg, 'relative_alt', 0)) / 1000.0
+        if self.current_lat is not None:
+            fix = NavSatFix()
+            fix.latitude = self.current_lat
+            fix.longitude = self.current_lon
+            fix.altitude = self.current_alt or 0.0
+            self.pub_gps.publish(fix)
+
+    def _send_goto_position_setpoint(self):
+        """Send a GLOBAL_RELATIVE_ALT_INT position setpoint, not BODY_NED velocity."""
+        m = self.master
+        if m is None or not self.is_airborne or self.goto_lat is None or self.goto_lon is None:
+            return
+        m.mav.set_position_target_global_int_send(
+            0, m.target_system, m.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            0x0DF8,
+            int(self.goto_lat * 1e7), int(self.goto_lon * 1e7), float(self.goto_alt),
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0
+        )
+
+    def _goto_reached(self) -> bool:
+        if self.goto_lat is None or self.goto_lon is None or self.current_lat is None:
+            return False
+        north = (self.goto_lat - self.current_lat) * 111320.0
+        east = (self.goto_lon - self.current_lon) * 111320.0 * max(0.2, math.cos(math.radians(self.current_lat)))
+        return math.hypot(north, east) <= 1.5
 
     def compute_tracking_velocities(self, now: float, dt: float, age: float) -> Tuple[float, float, float, float]:
         """Compute autonomous vision tracking velocities using pinhole & tree clearance."""
@@ -590,6 +864,13 @@ class MotionArbiter(Node):
                     elif error_y > self.deadband_y:
                         boost = self.kp_y_boost * (error_y - self.deadband_y)
                         vx = -(self.default_backup_speed + boost)
+                        if abs(error_x) > self.deadband_x:
+                            # At a bottom corner, separation is more important
+                            # than yaw alignment. Back straight until the target
+                            # returns to a usable part of the frame.
+                            substate = 'BACKING_UP_VISIBLE'
+                            vy = 0.0
+                            yaw_rate = 0.0
                     else:
                         vx = 0.0
                 else:
@@ -606,9 +887,12 @@ class MotionArbiter(Node):
             vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
         else:
             if self.last_seen_y > self.deadband_y:
-                if age <= 4.0:
+                # Keep a generous recovery window: a near-bottom target is
+                # likely still visible at the frame edge, so back away before
+                # rotating into a search pattern.
+                if age <= self.bottom_backup_timeout:
                     substate = 'BACKING_UP_TO_RECOVER'
-                    vx = -0.85
+                    vx = -1.10
                     vy = 0.0
                     yaw_rate = 0.0
                 else:
