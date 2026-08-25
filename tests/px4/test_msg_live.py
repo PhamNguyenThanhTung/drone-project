@@ -1,7 +1,7 @@
 import subprocess, time, os
 from pymavlink import mavutil
 
-subprocess.run("pkill -9 -f px4 2>/dev/null || true", shell=True)
+subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
 subprocess.run("pkill -9 -f \"gz si[m]\" 2>/dev/null || true", shell=True)
 time.sleep(1)
 
@@ -77,5 +77,5 @@ while time.time() - t1 < 10.0:
 print("Total message counts:", counts, flush=True)
 
 px4_proc.kill()
-subprocess.run("pkill -9 -f px4 2>/dev/null || true", shell=True)
+subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
 subprocess.run("pkill -9 -f \"gz si[m]\" 2>/dev/null || true", shell=True)

@@ -1,7 +1,7 @@
 import subprocess, time, os, sys
 from pymavlink import mavutil
 
-subprocess.run("pkill -9 -f px4 2>/dev/null || true", shell=True)
+subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
 subprocess.run("pkill -9 -f \"gz si[m]\" 2>/dev/null || true", shell=True)
 time.sleep(1)
 
@@ -106,5 +106,5 @@ else:
 print("=" * 65)
 
 px4_proc.kill()
-subprocess.run("pkill -9 -f px4 2>/dev/null || true", shell=True)
+subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
 subprocess.run("pkill -9 -f \"gz si[m]\" 2>/dev/null || true", shell=True)

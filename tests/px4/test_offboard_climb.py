@@ -1,7 +1,7 @@
 import subprocess, time, os
 from pymavlink import mavutil
 
-subprocess.run("pkill -9 -f px4 2>/dev/null || true", shell=True)
+subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
 subprocess.run("pkill -9 -f \"gz si[m]\" 2>/dev/null || true", shell=True)
 time.sleep(1)
 
@@ -131,6 +131,6 @@ while time.time() - t_hover < 5.0:
         print(f"[{time.time()-t_hover:4.1f}s] HOVERING: RelAlt = {rel_alt:4.2f} m", flush=True)
 
 px4_proc.kill()
-subprocess.run("pkill -9 -f px4 2>/dev/null || true", shell=True)
+subprocess.run("pkill -9 -x px4 2>/dev/null || true", shell=True)
 subprocess.run("pkill -9 -f \"gz si[m]\" 2>/dev/null || true", shell=True)
 print(">>> Finished climb test!", flush=True)
