@@ -203,64 +203,213 @@ class MotionArbiter(Node):
 
     def _auto_takeoff_worker(self):
         """Worker that waits for EKF2 stability and initiates takeoff automatically."""
-        self.get_logger().info(f"[AUTO-TAKEOFF] Waiting 5s for EKF2 stability, then auto-climbing to {self.takeoff_alt:.1f}m...")
-        time.sleep(5.0)
+        self.get_logger().info(f"[AUTO-TAKEOFF] Waiting for GPS/EKF position data...")
+        m = self.master
+        gps_ready = False
+        if m is not None:
+            t0 = time.time()
+            while time.time() - t0 < 30.0:
+                msg = m.recv_match(type=['GPS_RAW_INT', 'GLOBAL_POSITION_INT'], blocking=True, timeout=1.0)
+                if msg is not None and getattr(msg, 'lat', 0) != 0:
+                    gps_ready = True
+                    self.get_logger().info(
+                        f"[AUTO-TAKEOFF] GPS position ready: "
+                        f"Lat={msg.lat/1e7:.6f}°, Lon={msg.lon/1e7:.6f}°"
+                    )
+                    break
+                time.sleep(0.5)
+        if not gps_ready:
+            self.get_logger().error('[AUTO-TAKEOFF] No valid GPS position after 30s; refusing to arm.')
+            self.is_taking_off = False
+            return
+        time.sleep(2.0)
         self._execute_takeoff()
 
+    def _command_ack(self, command: int, *params: float, timeout: float = 3.0) -> bool:
+        """Send a command and require PX4 to accept it."""
+        m = self.master
+        if m is None:
+            return False
+        values = list(params) + [0.0] * (7 - len(params))
+        m.mav.command_long_send(
+            m.target_system, m.target_component, command, 0, *values[:7]
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ack = m.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.25)
+            if ack is None or ack.command != command:
+                continue
+            result = int(ack.result)
+            if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                return True
+            self.get_logger().warning(
+                f'[MAVLINK] Command {command} rejected (result={result})'
+            )
+            return False
+        self.get_logger().warning(f'[MAVLINK] No ACK for command {command}')
+        return False
+
+    def _send_offboard_velocity(self, vx: float, vy: float, vz: float, yaw_rate: float = 0.0):
+        """Send one BODY_NED velocity setpoint suitable for PX4 OFFBOARD mode."""
+        m = self.master
+        if m is None:
+            return
+        m.mav.set_position_target_local_ned_send(
+            0, m.target_system, m.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_NED,
+            0x05C7,
+            0, 0, 0,
+            float(vx), float(vy), float(vz),
+            0, 0, 0,
+            0.0, float(yaw_rate)
+        )
+
+    def _stream_offboard_velocity(
+        self, vx: float, vy: float, vz: float, duration: float,
+        yaw_rate: float = 0.0
+    ):
+        """Keep a setpoint alive at 20 Hz for the requested duration."""
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            self._send_offboard_velocity(vx, vy, vz, yaw_rate)
+            time.sleep(0.05)
+
+    def _wait_armed(self, timeout: float = 4.0, keep_offboard_alive: bool = False) -> bool:
+        """Confirm PX4 reports the vehicle as armed via heartbeat."""
+        m = self.master
+        deadline = time.time() + timeout
+        armed_flag = mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+        while m is not None and time.time() < deadline:
+            if keep_offboard_alive:
+                self._send_offboard_velocity(0.0, 0.0, 0.0)
+            hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=0.10)
+            if hb is not None and (int(hb.base_mode) & armed_flag):
+                return True
+        return False
+
+    def _wait_offboard(self, timeout: float = 4.0) -> bool:
+        """Confirm PX4 heartbeat reports OFFBOARD while keeping setpoints alive."""
+        m = self.master
+        deadline = time.time() + timeout
+        while m is not None and time.time() < deadline:
+            self._send_offboard_velocity(0.0, 0.0, 0.0)
+            hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=0.10)
+            if hb is None:
+                continue
+            custom_mode_enabled = (
+                int(hb.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+            )
+            main_mode = (int(hb.custom_mode) >> 16) & 0xFF
+            if custom_mode_enabled and main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD:
+                return True
+        return False
+
+    def _get_local_position(self, timeout: float = 5.0):
+        """Return the latest finite LOCAL_POSITION_NED sample."""
+        m = self.master
+        deadline = time.time() + timeout
+        while m is not None and time.time() < deadline:
+            msg = m.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=0.25)
+            if msg is None:
+                continue
+            if all(math.isfinite(float(getattr(msg, axis))) for axis in ('x', 'y', 'z')):
+                return msg
+        return None
+
     def _execute_takeoff(self):
-        """Direct, robust Arming, Takeoff, Warm-up, and OFFBOARD activation with retry."""
+        """Enter OFFBOARD, arm, and climb while verifying mode and altitude."""
         m = self.master
         if m is None:
             self.is_taking_off = False
             return
 
         self.is_taking_off = True
-        self.get_logger().info(f"[TAKEOFF] Arming and commanding Takeoff to {self.takeoff_alt:.1f} m...")
-
-        # 1. Arm with retry
-        for attempt in range(1, 6):
-            m.mav.command_long_send(
-                m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                0, 1.0, 0, 0, 0, 0, 0, 0
-            )
-            time.sleep(0.3)
-
-        # 2. Takeoff Command
-        m.mav.command_long_send(
-            m.target_system, m.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, float(self.takeoff_alt)
+        self.get_logger().info(
+            f"[TAKEOFF] Preparing OFFBOARD climb to {self.takeoff_alt:.1f} m..."
         )
-        time.sleep(1.5)
 
-        # 3. Offboard warm-up setpoints (15 frames at 20 Hz)
-        for _ in range(15):
-            m.mav.set_position_target_local_ned_send(
-                0, m.target_system, m.target_component,
-                mavutil.mavlink.MAV_FRAME_BODY_NED,
-                0x05C7,
-                0, 0, 0,
-                0.0, 0.0, 0.0,
-                0, 0, 0,
-                0.0, 0.0
-            )
-            time.sleep(0.05)
+        # Use the measured local-Z value as the ground reference. This avoids
+        # assuming that the estimator origin is exactly zero at startup.
+        local_position = self._get_local_position()
+        if local_position is None:
+            self.get_logger().error('[TAKEOFF] No valid local position; refusing to arm.')
+            self.is_taking_off = False
+            return
+        ground_z = float(local_position.z)
 
-        # 4. Switch to OFFBOARD
-        m.mav.command_long_send(
-            m.target_system, m.target_component,
+        # PX4 requires a continuous setpoint stream before it accepts OFFBOARD.
+        self._stream_offboard_velocity(0.0, 0.0, 0.0, duration=1.5)
+        if not self._command_ack(
             mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            0,
             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
             PX4_CUSTOM_MAIN_MODE_OFFBOARD,
-            0, 0, 0, 0, 0
-        )
+            0.0,
+            timeout=2.0
+        ) or not self._wait_offboard():
+            self.get_logger().error('[TAKEOFF] PX4 did not enter OFFBOARD; refusing to arm.')
+            self.is_taking_off = False
+            return
+
+        # Arm and confirm both the command ACK and the actual heartbeat state.
+        armed = False
+        for _ in range(5):
+            if self._command_ack(
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1.0
+            ) and self._wait_armed(keep_offboard_alive=True):
+                armed = True
+                break
+            self._stream_offboard_velocity(0.0, 0.0, 0.0, duration=0.5)
+            time.sleep(0.5)
+        if not armed:
+            self.get_logger().error('[TAKEOFF] PX4 did not arm; refusing takeoff.')
+            self.is_taking_off = False
+            return
+
+        # Negative NED Z velocity commands upward motion. Gazebo can run below
+        # real time under software rendering, so use a progress watchdog rather
+        # than a short wall-clock deadline that can land a healthy climbing UAV.
+        reached_altitude = False
+        last_reported_meter = -1
+        best_altitude = 0.0
+        progress_deadline = time.monotonic() + 30.0
+        absolute_deadline = time.monotonic() + max(90.0, self.takeoff_alt * 25.0)
+        while time.monotonic() < absolute_deadline and time.monotonic() < progress_deadline:
+            msg = m.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=0.10)
+            altitude = None
+            if msg is not None and math.isfinite(float(msg.z)):
+                altitude = ground_z - float(msg.z)
+                if altitude > best_altitude + 0.10:
+                    best_altitude = altitude
+                    progress_deadline = time.monotonic() + 30.0
+                report_meter = int(max(0.0, altitude))
+                if report_meter > last_reported_meter:
+                    last_reported_meter = report_meter
+                    self.get_logger().info(
+                        f'[TAKEOFF] OFFBOARD climb altitude: {altitude:.2f} m'
+                    )
+                if altitude >= self.takeoff_alt - 0.20:
+                    reached_altitude = True
+                    break
+
+            remaining = self.takeoff_alt - altitude if altitude is not None else self.takeoff_alt
+            climb_rate = -0.30 if remaining < 0.8 else -0.65
+            self._send_offboard_velocity(0.0, 0.0, climb_rate)
+
+        self._stream_offboard_velocity(0.0, 0.0, 0.0, duration=2.0)
+        if not reached_altitude:
+            self.get_logger().error(
+                f'[TAKEOFF] OFFBOARD climb did not reach {self.takeoff_alt - 0.2:.1f}m; landing.'
+            )
+            self._command_ack(mavutil.mavlink.MAV_CMD_NAV_LAND, timeout=2.0)
+            self.is_taking_off = False
+            return
 
         self.is_airborne = True
         self.is_taking_off = False
         self.set_state(STATE_TRACKING, trigger='takeoff_completed', target_id=None)
-        self.get_logger().info(f"[TAKEOFF] Drone Airborne! Target altitude: {self.takeoff_alt:.1f}m. OFFBOARD active.")
+        self.get_logger().info(
+            f"[TAKEOFF] Drone Airborne at {self.takeoff_alt:.1f}m. OFFBOARD tracking active."
+        )
 
     # ------------------------------------------------------------------
     # State Machine & Transitions
@@ -310,9 +459,10 @@ class MotionArbiter(Node):
 
         if is_active_move and self.current_state != STATE_MANUAL:
             self.set_state(STATE_MANUAL, trigger='manual_override', target_id=None)
-            # This node also subscribes to /tracking/select_target. Publishing
-            # -1 here fed the clear message back into its own state machine and
-            # immediately replaced MANUAL with STANDBY.
+            # Do not publish a synthetic -1 on /tracking/select_target here.
+            # This node subscribes to that topic too, so doing so immediately
+            # fed the message back into on_target_selected() and changed the
+            # freshly selected MANUAL state to STANDBY.
 
     def on_target_selected(self, msg: Int32):
         """Handle target selection (Click on box or Keys [1-9, 0, SPACE])."""
@@ -398,16 +548,7 @@ class MotionArbiter(Node):
         # Dispatch single MAVLink velocity setpoint to PX4 OFFBOARD
         m = self.master
         if m is not None and self.is_airborne:
-            velocity_yaw_rate_mask = 0x05C7
-            m.mav.set_position_target_local_ned_send(
-                0, m.target_system, m.target_component,
-                mavutil.mavlink.MAV_FRAME_BODY_NED,
-                velocity_yaw_rate_mask,
-                0, 0, 0,
-                float(final_vx), float(final_vy), float(final_vz),
-                0, 0, 0,
-                0.0, float(final_yaw_rate)
-            )
+            self._send_offboard_velocity(final_vx, final_vy, final_vz, final_yaw_rate)
 
     def compute_tracking_velocities(self, now: float, dt: float, age: float) -> Tuple[float, float, float, float]:
         """Compute autonomous vision tracking velocities using pinhole & tree clearance."""
