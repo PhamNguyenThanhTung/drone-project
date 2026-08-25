@@ -1,0 +1,383 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="person_tracking_approach">
+    <!-- 1. Cấu hình Physics: max_step_size 1ms, real_time_factor 1.0 -->
+    <physics type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_update_rate>250</real_time_update_rate>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- 2. Các Plugin gz-sim cốt lõi -->
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+    <plugin filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <!-- Required by PX4 GZBridge for the x500 barometer/EKF preflight check. -->
+    <plugin filename="gz-sim-air-pressure-system"
+      name="gz::sim::systems::AirPressure">
+    </plugin>
+    <plugin filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+
+    <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic"/>
+
+    <!-- 3. Scene & Sky & Ánh sáng môi trường -->
+    <scene>
+      <ambient>0.8 0.8 0.8 1.0</ambient>
+      <background>0.7 0.85 1.0 1.0</background>
+      <sky>
+        <clouds>
+          <speed>12</speed>
+        </clouds>
+      </sky>
+    </scene>
+
+    <!-- 4. Toạ độ địa lý (GPS/NavSat cho ArduPilot SITL) -->
+    <spherical_coordinates>
+      <latitude_deg>47.397742</latitude_deg>
+      <longitude_deg>8.545594</longitude_deg>
+      <elevation>488.0</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <!-- 5. Nguồn sáng mặt trời (Directional Sun Light) -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 50 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.4 0.2 -0.9</direction>
+    </light>
+
+    <!-- 6. Trục toạ độ tham chiếu + GPS NavSat Sensor cho SITL -->
+    <model name="axes">
+      <static>1</static>
+      <link name="link">
+        <visual name="r">
+          <cast_shadows>0</cast_shadows>
+          <pose>5 0 0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.05 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 0.8</ambient>
+            <diffuse>1 0 0 0.8</diffuse>
+            <emissive>1 0 0 0.8</emissive>
+          </material>
+        </visual>
+        <visual name="g">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 5 0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.05 10 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 1 0 0.8</ambient>
+            <diffuse>0 1 0 0.8</diffuse>
+            <emissive>0 1 0 0.8</emissive>
+          </material>
+        </visual>
+        <visual name="b">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 0 5.0 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.05 0.05 10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 0 1 0.8</ambient>
+            <diffuse>0 0 1 0.8</diffuse>
+            <emissive>0 0 1 0.8</emissive>
+          </material>
+        </visual>
+        <sensor name="navsat_sensor" type="navsat">
+          <always_on>1</always_on>
+          <update_rate>1</update_rate>
+        </sensor>
+      </link>
+    </model>
+
+    <!-- 7. Mặt đất bãi cỏ rộng (Ground Grass Plane >= 140x140m) -->
+    <model name="ground_grass">
+      <static>true</static>
+      <link name="ground_link">
+        <collision name="ground_collision">
+          <pose>0 0 -0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>140 140 0.10</size>
+            </box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>100</mu>
+                <mu2>50</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="ground_visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>140 140</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.22 0.48 0.16 1.0</ambient>
+            <diffuse>0.28 0.55 0.20 1.0</diffuse>
+            <specular>0.05 0.08 0.05 1.0</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 8. Mạng lưới đường đi / vỉa hè công viên (Park Walkway Network với Ngã tư & Zic-Zac) -->
+    <model name="park_walkway">
+      <static>true</static>
+      <link name="walkway_link">
+        <!-- Đường chính Đông - Tây: từ (-2.0, 5.0) đến (10.0, 5.0) -->
+        <visual name="segment_1_visual">
+          <pose>5.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>14.0 2.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.62 0.62 0.62 1.0</ambient>
+            <diffuse>0.68 0.68 0.68 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="segment_1_col">
+          <pose>5.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>14.0 2.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đường cắt ngang Bắc - Nam tại X = 6.0: từ (6.0, -3.0) đến (6.0, 11.0) -->
+        <visual name="cross_segment_visual">
+          <pose>6.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="cross_segment_col">
+          <pose>6.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 15.0 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 2: từ (10, 5) đến (10, 15) -->
+        <visual name="segment_2_visual">
+          <pose>10.0 10.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 12.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="segment_2_col">
+          <pose>10.0 10.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 12.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 3: từ (10, 15) đến (20, 15) -->
+        <visual name="segment_3_visual">
+          <pose>15.0 15.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.5 2.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.62 0.62 0.62 1.0</ambient>
+            <diffuse>0.68 0.68 0.68 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="segment_3_col">
+          <pose>15.0 15.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.5 2.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 4: từ (20, 15) đến (20, 5) -->
+        <visual name="segment_4_visual">
+          <pose>20.0 10.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 12.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="segment_4_col">
+          <pose>20.0 10.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 12.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 5: từ (20, 5) đến (30, 5) -->
+        <visual name="segment_5_visual">
+          <pose>25.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.5 2.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.62 0.62 0.62 1.0</ambient>
+            <diffuse>0.68 0.68 0.68 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="segment_5_col">
+          <pose>25.0 5.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.5 2.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <!-- Đoạn 6: từ (30, 5) đến (30, 15) -->
+        <visual name="segment_6_visual">
+          <pose>30.0 10.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 12.5 0.03</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.60 0.60 0.60 1.0</ambient>
+            <diffuse>0.66 0.66 0.66 1.0</diffuse>
+            <specular>0.15 0.15 0.15 1.0</specular>
+          </material>
+        </visual>
+        <collision name="segment_6_col">
+          <pose>30.0 10.0 0.015 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2.5 12.5 0.03</size>
+            </box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    
+
+    <!-- ================================================================= -->
+    <!-- 10. TARGET CHÍNH: Person A (walking_person)                       -->
+    <!-- Đặc tính: Áo xanh dương, Quần tối màu, Không mũ, Không balo       -->
+    <!-- ================================================================= -->
+    <actor name="walking_person">
+      <skin>
+        <filename>model://pedestrian_blue/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+      </skin>
+      <animation name="walk">
+        <filename>model://pedestrian_blue/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+        <interpolate_x>true</interpolate_x>
+      </animation>
+      <script>
+        <loop>true</loop>
+        <delay_start>5.0</delay_start>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="walk">
+          <!-- Approach-test path: paces 3-8 m ahead of the drone spawn
+               (origin, facing +X) so the person stays inside the camera
+               FOV for the entire loop. Used by tests/px4/test_approach_camera.py -->
+          <waypoint>
+            <time>0.0</time>
+            <pose>8.0 0.5 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>6.0</time>
+            <pose>3.0 0.5 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+          <waypoint>
+            <time>7.0</time>
+            <pose>3.0 0.5 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>13.0</time>
+            <pose>8.0 0.5 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>14.0</time>
+            <pose>8.0 0.5 0.8891414 0 0 3.14159</pose>
+          </waypoint>
+        </trajectory>
+      </script>
+    </actor>
+
+    
+
+  </world>
+</sdf>
