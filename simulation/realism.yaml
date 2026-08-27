@@ -1,0 +1,23 @@
+/**:
+  ros__parameters:
+    # Camera: 30 ms latency, 5% frame loss, and a small Gaussian motion blur.
+    camera_delay_ms: 30.0
+    camera_drop_probability: 0.05
+    camera_motion_blur_pixels: 5
+    # Set these topic names when the PX4 bridge exposes raw sensor topics.
+    imu_input: ''
+    gps_input: ''
+    baro_input: ''
+    imu_noise_stddev: 0.015
+    imu_bias: [0.02, -0.01, 0.03]
+    imu_drift_per_s: [0.0005, -0.0003, 0.0007]
+    gps_noise_m: 1.5
+    gps_dropout_probability: 0.01
+    baro_noise_pa: 1.2
+    sensor_dropout_probability: 0.005
+    seed: 7
+
+    # PX4 parameter checklist (apply with px4-param or QGroundControl):
+    # GF_ACTION=3 (RTL), GF_MAX_HOR_DIST=30, GF_MAX_VER_DIST=15,
+    # NAV_DLL_ACT=2 (RTL), COM_DL_LOSS_T=5, COM_OF_LOSS_T=1.
+    # LNDMC_ALT_GND=2 enables PX4 ground-effect protection near the surface.

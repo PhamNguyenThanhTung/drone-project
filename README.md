@@ -1,6 +1,6 @@
 # UAV Vision Tracking & Autonomous Follower (PX4 SITL + Gazebo Harmonic)
 
-Hệ thống bám đuổi mục tiêu thông minh thời gian thực (Autonomous Vision Tracking & Teleop) cho Drone Quadcopter sử dụng **PX4 Autopilot SITL**, **Gazebo Harmonic**, **ROS 2 Humble**, **YOLOv8 + ByteTrack**, **OSNet Re-ID**, và kiến trúc **State Machine MotionArbiter**.
+Hệ thống bám đuổi mục tiêu thông minh thời gian thực (Autonomous Vision Tracking & Teleop) cho Drone Quadcopter sử dụng **PX4 Autopilot SITL**, **Gazebo Harmonic**, **ROS 2 Humble**, **YOLOv8 + ByteTrack**, và kiến trúc **State Machine MotionArbiter**.
 
 ---
 
@@ -88,3 +88,23 @@ Tất cả thao tác điều khiển được tích hợp **trên cùng cửa s�
 
 * **Zero-Latency Manual Override**: Khi drone đang tự động bay bám mục tiêu (`TRACKING`), ngay khi bạn bấm bất kỳ phím lái nào (`W/A/S/D`), quyền điều khiển sẽ chuyển ngay sang `MANUAL` trong vòng $< 10\text{ ms}$.
 * **Failsafe Watchdog**: Nếu mục tiêu bị mất dấu quá $4.0\text{s}$, drone tự động chuyển sang `STANDBY` (Hover an toàn tại chỗ) chứ không tự ý bay mất kiểm soát.
+
+---
+
+## 5. Mô phỏng thực tế và kiểm thử an toàn
+
+World mặc định có gió ngang và nhiễu loạn. PX4 `x500_base` cung cấp nhiễu
+IMU/barometer cơ bản; profile `simulation/realism.yaml` bổ sung camera lag,
+frame loss, motion blur và fault injection có seed để test lặp lại được:
+
+```bash
+SIM_REALISM=1 COMPANION_CPUSET=0,1 YOLO_MAX_FPS=15 YOLO_IMGSZ=416 ./start_stack.sh
+python3 simulation/inject_failure.py gps off
+python3 simulation/inject_failure.py gps ok
+```
+
+Thông số khối lượng, quán tính, thrust curve và battery curve của drone thật
+phải được đo và điền vào `simulation/vehicle_profile.yaml`; project không giả
+định các giá trị này. Quy trình bắt buộc là SITL -> HIL -> test tháo cánh ->
+dây an toàn -> bay geofence. Chi tiết và điều kiện qua từng bước nằm trong
+`simulation/README.md`.

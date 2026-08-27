@@ -66,6 +66,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('lock_reacquire_s', 2.5)
         self.declare_parameter('reacquire_min_iou', 0.15)
         self.declare_parameter('log_period', 1.5)
+        self.declare_parameter('max_frame_rate', 0.0)
 
         gp = self.get_parameter
         self.image_topic = gp('image_topic').value
@@ -99,6 +100,8 @@ class YoloDetectorNode(Node):
         self.lock_reacquire_s = float(gp('lock_reacquire_s').value)
         self.reacquire_min_iou = float(gp('reacquire_min_iou').value)
         self.log_period = float(gp('log_period').value)
+        self.max_frame_rate = float(gp('max_frame_rate').value)
+        self.last_inference_monotonic = 0.0
 
         self.bridge = CvBridge()
         self.get_logger().info(
@@ -154,6 +157,11 @@ class YoloDetectorNode(Node):
 
     # ------------------------------------------------------------------
     def on_image(self, msg):
+        now = time.monotonic()
+        if (self.max_frame_rate > 0.0 and self.last_inference_monotonic > 0.0
+                and now - self.last_inference_monotonic < 1.0 / self.max_frame_rate):
+            return
+        self.last_inference_monotonic = now
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as exc:  # noqa: BLE001

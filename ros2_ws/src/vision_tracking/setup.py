@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='tungt',
     maintainer_email='tungt@todo.todo',
-    description='Phase 2: YOLOv8 + ByteTrack person tracking and PID gimbal control',
+    description='YOLOv8 tracking and repeatable simulation realism/fault injection',
     license='Apache-2.0',
     extras_require={
         'test': [
@@ -25,8 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'yolo_detector_node = vision_tracking.yolo_detector_node:main',
-            'gimbal_controller_node = vision_tracking.gimbal_controller_node:main',
-            'tracking_eval = vision_tracking.tracking_eval:main',
+            'sim_realism_node = vision_tracking.sim_realism_node:main',
         ],
     },
 )

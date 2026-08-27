@@ -3,7 +3,7 @@
 <package format="3">
   <name>vision_tracking</name>
   <version>0.0.0</version>
-  <description>Phase 2: YOLOv8 + ByteTrack person tracking and PID gimbal control</description>
+  <description>YOLOv8 tracking and repeatable simulation realism/fault injection</description>
   <maintainer email="tungt@todo.todo">tungt</maintainer>
   <license>Apache-2.0</license>
 
