@@ -430,20 +430,6 @@ class MotionArbiter(Node):
         if m is None:
             return
 
-        if self.is_taking_off:
-            # During initial climb phase, send raw BODY_NED climb velocity
-            m.mav.set_position_target_local_ned_send(
-                0, m.target_system, m.target_component,
-                mavutil.mavlink.MAV_FRAME_BODY_NED,
-                0x05C7,
-                0, 0, 0,
-                float(vx), float(vy), float(vz),
-                0, 0, 0,
-                0.0, float(yaw_rate)
-            )
-            return
-
-        # In airborne tracking and teleop, convert body velocity (vx, vy) to Local NED
         yaw = getattr(self, 'current_yaw', 0.0)
         # Advance target yaw smoothly according to yaw_rate
         target_yaw = yaw + yaw_rate * 0.10
@@ -454,7 +440,8 @@ class MotionArbiter(Node):
         vx_ned = vx * cos_y - vy * sin_y
         vy_ned = vx * sin_y + vy * cos_y
 
-        target_z = getattr(self, 'target_z_ned', self.ground_z - self.takeoff_alt)
+        ground_z = getattr(self, 'ground_z', 0.0)
+        target_z = getattr(self, 'target_z_ned', ground_z - self.takeoff_alt)
 
         # 0x01E3: Position Z active (PX4 EKF2 P-position loop maintains altitude),
         # Velocity X/Y active in NED frame, Yaw angle and Yaw Rate both active for responsive turns.
