@@ -77,6 +77,9 @@ class MotionArbiter(Node):
         self.declare_parameter('goto_altitude', 3.8)
         self.declare_parameter('bottom_backup_timeout', 1.5)
         self.declare_parameter('bottom_recovery_timeout', 2.5)
+        self.declare_parameter('target_area_min', 6000.0)
+        self.declare_parameter('target_area_max', 13000.0)
+        self.declare_parameter('kp_area', 0.00015)
 
         gp = self.get_parameter
         self.mavlink_uri = gp('mavlink').value
@@ -100,6 +103,9 @@ class MotionArbiter(Node):
         self.goto_altitude = float(gp('goto_altitude').value)
         self.bottom_backup_timeout = float(gp('bottom_backup_timeout').value)
         self.bottom_recovery_timeout = float(gp('bottom_recovery_timeout').value)
+        self.target_area_min = float(gp('target_area_min').value)
+        self.target_area_max = float(gp('target_area_max').value)
+        self.kp_area = float(gp('kp_area').value)
 
         # State Machine (Default: STANDBY - waits for user click/key before tracking)
         self.current_state = STATE_STANDBY
@@ -927,7 +933,17 @@ class MotionArbiter(Node):
 
         if error_x is not None and age <= 1.2:
             self.dist_advanced = 0.0
-            in_safe_zone = (abs(error_x) <= self.deadband_x and abs(error_y) <= self.deadband_y)
+
+            # Bounding box size (distance) evaluation
+            is_box_small = (self.area is not None and self.area > 50.0 and self.area < self.target_area_min)
+            is_box_large = (self.area is not None and self.area > self.target_area_max)
+
+            in_safe_zone = (
+                abs(error_x) <= self.deadband_x
+                and abs(error_y) <= self.deadband_y
+                and not is_box_small
+                and not is_box_large
+            )
 
             if in_safe_zone:
                 vx = 0.0
@@ -946,11 +962,22 @@ class MotionArbiter(Node):
 
                 if self.enable_forward:
                     if error_y < -self.deadband_y:
+                        # Person is high in frame -> advance forward
                         boost = self.kp_y_boost * (-error_y - self.deadband_y)
                         vx = self.default_walk_speed + boost
                         substate = 'ADVANCING'
-                    elif error_y > self.deadband_y:
-                        boost = self.kp_y_boost * (error_y - self.deadband_y)
+                    elif is_box_small:
+                        # Person is centered but small in frame (too far away) -> actively close in!
+                        area_deficit = self.target_area_min - (self.area if self.area is not None else 0.0)
+                        boost = self.kp_area * max(0.0, area_deficit)
+                        vx = self.default_walk_speed + boost
+                        substate = 'ADVANCING_CLOSE_IN'
+                    elif error_y > self.deadband_y or is_box_large:
+                        # Person is too low in frame or box is very large -> back away smoothly
+                        if error_y > self.deadband_y:
+                            boost = self.kp_y_boost * (error_y - self.deadband_y)
+                        else:
+                            boost = self.kp_area * (self.area - self.target_area_max)
                         vx = -(self.default_backup_speed + boost)
                         substate = 'BACKING_SMOOTH'
                         # Active yaw tracking during backing to keep camera centered on turns
