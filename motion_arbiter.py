@@ -445,6 +445,10 @@ class MotionArbiter(Node):
 
         # In airborne tracking and teleop, convert body velocity (vx, vy) to Local NED
         yaw = getattr(self, 'current_yaw', 0.0)
+        # Advance target yaw smoothly according to yaw_rate
+        target_yaw = yaw + yaw_rate * 0.10
+        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+
         cos_y = math.cos(yaw)
         sin_y = math.sin(yaw)
         vx_ned = vx * cos_y - vy * sin_y
@@ -452,16 +456,16 @@ class MotionArbiter(Node):
 
         target_z = getattr(self, 'target_z_ned', self.ground_z - self.takeoff_alt)
 
-        # 0x05E3: Position Z active (let PX4 EKF2 P-position loop maintain altitude),
-        # Velocity X/Y active in NED frame, Velocity Z ignored for position loop, Yaw Rate active.
+        # 0x01E3: Position Z active (PX4 EKF2 P-position loop maintains altitude),
+        # Velocity X/Y active in NED frame, Yaw angle and Yaw Rate both active for responsive turns.
         m.mav.set_position_target_local_ned_send(
             0, m.target_system, m.target_component,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0x05E3,
+            0x01E3,
             0.0, 0.0, float(target_z),
             float(vx_ned), float(vy_ned), 0.0,
             0.0, 0.0, 0.0,
-            0.0, float(yaw_rate)
+            float(target_yaw), float(yaw_rate)
         )
 
     def _stream_offboard_velocity(
