@@ -59,17 +59,17 @@ class MotionArbiter(Node):
         self.declare_parameter('mavlink', 'udpin:0.0.0.0:14540')
         self.declare_parameter('auto_takeoff', True)
         self.declare_parameter('takeoff_alt', 3.8)
-        self.declare_parameter('kp', 0.0065)
-        self.declare_parameter('max_rate', 0.75)
-        self.declare_parameter('search_rate', 0.40)
+        self.declare_parameter('kp', 0.0120)
+        self.declare_parameter('max_rate', 1.40)
+        self.declare_parameter('search_rate', 0.85)
         self.declare_parameter('lost_timeout', 2.5)
         self.declare_parameter('enable_forward', True)
         self.declare_parameter('default_walk_speed', 0.75)
         self.declare_parameter('default_backup_speed', 0.60)
         self.declare_parameter('kp_y_boost', 0.0050)
-        self.declare_parameter('kp_lateral', 0.0035)
-        self.declare_parameter('deadband_x', 25.0)
-        self.declare_parameter('deadband_y', 30.0)
+        self.declare_parameter('kp_lateral', 0.0040)
+        self.declare_parameter('deadband_x', 20.0)
+        self.declare_parameter('deadband_y', 25.0)
         self.declare_parameter('max_forward_speed', 1.35)
         self.declare_parameter('min_forward_speed', -0.80)
         self.declare_parameter('tree_clearance_margin', 1.8)
@@ -989,9 +989,12 @@ class MotionArbiter(Node):
                 else:
                     vx = 0.0
 
-                # Slow down forward speed when target is off-center to prioritize yaw alignment
+                # Prioritize heading rotation: if target is off-center, stop forward advance so drone pivots directly to target
                 if abs(error_x) > 40.0:
-                    scale = max(0.30, 1.0 - (abs(error_x) - 40.0) / 100.0)
+                    vx = 0.0
+                    substate = 'YAW_ALIGN_TURN'
+                elif abs(error_x) > 15.0:
+                    scale = max(0.0, 1.0 - (abs(error_x) - 15.0) / 25.0)
                     vx *= scale
 
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
@@ -1005,9 +1008,9 @@ class MotionArbiter(Node):
             vy = 0.0
             vz = 0.0
             if age <= 2.5:
-                # Rotate towards the last known direction (target_turn_dir) to scan and bring target back into FOV
+                # Rotate briskly towards the last known direction (target_turn_dir) to scan and re-acquire target
                 substate = 'RECOVERING_YAW_HEADING'
-                yaw_rate = self.target_turn_dir * 0.45
+                yaw_rate = self.target_turn_dir * self.search_rate
             else:
                 substate = 'SEARCHING_HOLD'
                 yaw_rate = 0.0
@@ -1020,7 +1023,7 @@ class MotionArbiter(Node):
         vx = max(self._last_vx - max_accel_x, min(self._last_vx + max_accel_x, vx))
         max_accel_y = 0.8 * dt
         vy = max(self._last_vy - max_accel_y, min(self._last_vy + max_accel_y, vy))
-        max_yaw_accel = 2.5 * dt
+        max_yaw_accel = 6.0 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
 
         if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):
