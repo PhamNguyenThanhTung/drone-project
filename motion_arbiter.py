@@ -103,8 +103,8 @@ class MotionArbiter(Node):
         self.bottom_backup_timeout = float(gp('bottom_backup_timeout').value)
         self.bottom_recovery_timeout = float(gp('bottom_recovery_timeout').value)
 
-        # State Machine (Default: TRACKING)
-        self.current_state = STATE_TRACKING
+        # State Machine (Default: STANDBY - waits for user click/key before tracking)
+        self.current_state = STATE_STANDBY
         self.active_target_id: Optional[int] = None
         self.is_airborne = False
         self.is_taking_off = False
@@ -604,9 +604,9 @@ class MotionArbiter(Node):
 
         self.is_airborne = True
         self.is_taking_off = False
-        self.set_state(STATE_TRACKING, trigger='takeoff_completed', target_id=None)
+        self.set_state(STATE_STANDBY, trigger='takeoff_completed', target_id=None)
         self.get_logger().info(
-            f"[TAKEOFF] Drone Airborne at {self.takeoff_alt:.1f}m. OFFBOARD tracking active."
+            f"[TAKEOFF] Drone Airborne at {self.takeoff_alt:.1f}m. Hovering in STANDBY (awaiting user target selection)."
         )
 
     # ------------------------------------------------------------------
@@ -775,12 +775,11 @@ class MotionArbiter(Node):
                     self.set_state(STATE_STANDBY, trigger='vehicle_disarm_detected', target_id=None)
                     state = self.current_state
 
-            effective_lost_timeout = (
-                getattr(self, 'bottom_recovery_timeout', self.lost_timeout)
-                if getattr(self, 'last_seen_y', 0.0) > self.deadband_y
-                else self.lost_timeout
-            )
+            effective_lost_timeout = 2.5
             if state == STATE_TRACKING and self.acquired_once and age > effective_lost_timeout:
+                self.get_logger().info(
+                    f'[TRACKING] Target lost for {age:.1f}s (> {effective_lost_timeout}s) -> Returning to STANDBY hover.'
+                )
                 self.set_state(STATE_STANDBY, trigger='target_lost_timeout', target_id=None)
                 state = self.current_state
 
@@ -977,36 +976,20 @@ class MotionArbiter(Node):
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
 
         elif not acquired_once:
-            substate = 'WAITING_FOR_PERSON'
+            substate = 'WAITING_FOR_TARGET'
             vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
         else:
-            if self.last_seen_y > self.deadband_y:
-                # Near-bottom target lost: back away smoothly for up to 1.8s, then scan in place
-                if age <= self.bottom_backup_timeout:
-                    substate = 'BACKING_UP_TO_RECOVER'
-                    vx = -self.default_backup_speed
-                    vy = 0.0
-                    yaw_rate = self.target_turn_dir * 0.15
-                else:
-                    substate = 'SEARCHING'
-                    yaw_rate = self.direction * self.search_rate
-                    vx, vy = 0.0, 0.0
+            # Target was lost from view: STOP forward/lateral motion immediately so drone does not wander off
+            vx = 0.0
+            vy = 0.0
+            vz = 0.0
+            if age <= 2.5:
+                # Rotate towards the last known direction (target_turn_dir) to scan and bring target back into FOV
+                substate = 'RECOVERING_YAW_HEADING'
+                yaw_rate = self.target_turn_dir * 0.40
             else:
-                if self.dist_advanced < target_dist and age <= 4.0:
-                    substate = 'ADVANCING_TO_TURN_POINT'
-                    speed = 1.0
-                    vx = speed * (target_dx / target_dist)
-                    vy = speed * (target_dy / target_dist)
-                    yaw_rate = 0.0
-                    self.dist_advanced += speed * dt
-                elif age <= 7.0:
-                    substate = 'ROTATING_AT_TURN_POINT'
-                    vx, vy = 0.0, 0.0
-                    yaw_rate = self.target_turn_dir * 0.35
-                else:
-                    substate = 'SEARCHING'
-                    yaw_rate = self.direction * self.search_rate
-                    vx, vy = 0.0, 0.0
+                substate = 'SEARCHING_HOLD'
+                yaw_rate = 0.0
 
         yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
 
