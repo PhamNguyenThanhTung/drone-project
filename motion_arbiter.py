@@ -1009,15 +1009,16 @@ class MotionArbiter(Node):
             vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
         else:
             # Target was lost from view:
-            # If target was approaching or near bottom, back up smoothly for 1.2s to re-capture in wide FOV
-            if self.last_seen_y > self.deadband_y and age <= 1.2:
-                substate = 'BACKING_UP_TO_RECOVER'
-                vx = -self.default_backup_speed * 0.70
+            # If target exited via the bottom of the frame (walked past underneath):
+            # Execute a clean, decisive 180-degree turnaround spin to face the walker!
+            if self.last_seen_y > self.deadband_y and age <= 2.2:
+                substate = 'TURNAROUND_180'
+                vx = 0.0
                 vy = 0.0
                 vz = 0.0
-                yaw_rate = 0.0
+                yaw_rate = self.target_turn_dir * 1.25
             elif age <= 2.5:
-                # Rotate towards last turn direction to scan
+                # Target turned off-screen laterally: rotate towards turn direction to scan
                 substate = 'RECOVERING_YAW_HEADING'
                 vx = 0.0
                 vy = 0.0

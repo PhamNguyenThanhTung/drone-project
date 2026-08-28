@@ -166,6 +166,11 @@ def main():
                 break
             time.sleep(0.2)
 
+        # Send target selection command to engage TRACKING mode on Person ID=0
+        print(">>> Gửi lệnh khóa mục tiêu Person ID=0 để bắt đầu bám đuổi...")
+        subprocess.run("bash -c 'source /opt/ros/humble/setup.bash && ros2 topic pub --once /tracking/select_target std_msgs/msg/Int32 \"{data: 0}\"' 2>/dev/null || true", shell=True)
+        time.sleep(1.0)
+
         # Telemetry logging loop
         print("\n" + "=" * 82)
         print(">>> BẮT ĐẦU GHI LOG BÁM MỤC TIÊU (PERSON TURN-AROUND & MOVEMENT) - 30 GIÂY...")
@@ -214,26 +219,29 @@ def main():
                 except Exception:
                     pass
 
-            substate = diag_entry.get('substate', 'UNKNOWN')
-            alt_diag = diag_entry.get('current_alt', alt_m)
-            alt_err = diag_entry.get('alt_error', alt_diag - 3.8)
-            cmd_yaw_rate = diag_entry.get('cmd_yaw_rate', 0.0) * 57.2958
+            substate = str(diag_entry.get('substate') or 'STANDBY')
+            alt_diag = diag_entry.get('current_alt', None)
+            alt_err = diag_entry.get('alt_error', None)
+            cmd_yaw_rate = (diag_entry.get('cmd_yaw_rate', 0.0) or 0.0) * 57.2958
             err_x = diag_entry.get('error_x', None)
             err_y = diag_entry.get('error_y', None)
             t_id = diag_entry.get('target_id', -1)
             target_detected = err_x is not None and (diag_entry.get('age', 99.0) <= 0.5)
 
-            effective_alt = alt_diag if alt_diag > 1.5 else alt_m
+            effective_alt = float(alt_diag) if (alt_diag is not None and alt_diag > 1.5) else float(alt_m if alt_m is not None else 3.8)
+            effective_alt_err = float(alt_err) if alt_err is not None else float(effective_alt - 3.8)
+            effective_yaw_rate = float(yaw_rate_deg_s) if yaw_rate_deg_s is not None else 0.0
+            effective_yaw_deg = float(yaw_deg) if yaw_deg is not None else 0.0
 
-            row = f"{elapsed:.1f},{effective_alt:.3f},{alt_err:.3f},{yaw_rate_deg_s:.2f},{yaw_deg:.1f},{err_x if err_x is not None else ''},{err_y if err_y is not None else ''},{t_id},{diag_entry.get('state', 'UNKNOWN')},{substate},{target_detected}\n"
+            row = f"{elapsed:.1f},{effective_alt:.3f},{effective_alt_err:.3f},{effective_yaw_rate:.2f},{effective_yaw_deg:.1f},{err_x if err_x is not None else ''},{err_y if err_y is not None else ''},{t_id},{diag_entry.get('state', 'UNKNOWN')},{substate},{target_detected}\n"
             csv_file.write(row)
             csv_file.flush()
 
             records.append({
                 'elapsed': elapsed,
                 'alt': effective_alt,
-                'alt_err': alt_err,
-                'yaw_rate': yaw_rate_deg_s,
+                'alt_err': effective_alt_err,
+                'yaw_rate': effective_yaw_rate,
                 'cmd_yaw_rate': cmd_yaw_rate,
                 'err_x': err_x,
                 'err_y': err_y,
@@ -243,9 +251,13 @@ def main():
 
             if now - last_print >= 1.0:
                 last_print = now
+                alt_str = f"{effective_alt:6.2f}m"
+                err_alt_str = f"{effective_alt_err:+6.2f}m"
+                yaw_r_str = f"{effective_yaw_rate:+8.1f}°/s"
                 ex_str = f"{err_x:+.1f}" if err_x is not None else "---"
                 ey_str = f"{err_y:+.1f}" if err_y is not None else "---"
-                print(f"{elapsed:6.1f}s  | {effective_alt:6.2f}m  | {alt_err:+6.2f}m  | {yaw_rate_deg_s:+8.1f}°/s    | {ex_str:<7} | {ey_str:<7} | {substate:<22}")
+                sub_str = f"{substate:<22}"
+                print(f"{elapsed:6.1f}s  | {alt_str} | {err_alt_str} | {yaw_r_str} | {ex_str:<7} | {ey_str:<7} | {sub_str}")
 
             time.sleep(0.05)
 
@@ -278,7 +290,8 @@ def main():
         return 0
 
     except Exception as exc:
-        print(f"LỖI: {exc}")
+        import traceback
+        traceback.print_exc()
         return 1
     finally:
         print("\n>>> Dọn dẹp tiến trình mô phỏng...")
