@@ -284,8 +284,14 @@ def test_full_6_state_machine_cases():
             self.active_camera_pitch = 0.65
             self.vx_filtered = 0.0
             self.vy_filtered = 0.0
-            self.vz_filtered = 0.0
-            self.yaw_rate_filtered = 0.0
+            self.takeoff_alt = 3.8
+            self.bottom_recovery_timeout = 3.0
+            self.bottom_backup_timeout = 1.8
+            self.diag_file_handle = None
+            self.current_alt = 3.8
+            self.pub_gps = None
+            self._update_gps_telemetry = lambda: None
+            self._send_offboard_velocity = lambda vx, vy, vz, yaw: None
             self.target_acquired = False
 
         def get_logger(self):

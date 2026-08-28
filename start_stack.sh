@@ -8,7 +8,10 @@ source /opt/ros/humble/setup.bash
 # install silently served the pre-fix yolo_detector_node to `ros2 run` while
 # every direct-source test used the new code. Rebuilding costs ~1 s; running
 # yesterday's detector cost a whole debugging session.
-echo "[0/5] Rebuild ROS 2 workspace (guard against a stale install)..."
+echo "[0/5] Rebuild ROS 2 workspace & ensure PX4 airframe patch..."
+if [[ -f "${PROJECT_DIR}/scripts/apply_px4_patch.sh" ]]; then
+  "${PROJECT_DIR}/scripts/apply_px4_patch.sh" --apply "${PX4_DIR}" || true
+fi
 (cd "${PROJECT_DIR}/ros2_ws" && colcon build --symlink-install)
 if [[ -f "${PROJECT_DIR}/ros2_ws/install/setup.bash" ]]; then
   source "${PROJECT_DIR}/ros2_ws/install/setup.bash"

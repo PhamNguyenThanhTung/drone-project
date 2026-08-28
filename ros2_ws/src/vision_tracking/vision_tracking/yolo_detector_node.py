@@ -413,7 +413,7 @@ class YoloDetectorNode(Node):
         return inter / union if union > 0.0 else 0.0
 
     def _reacquire_lock(self, cands):
-        """Re-bind a manual lock to the same person after a track-id switch."""
+        """Re-bind a manual lock to the same person after a track-id switch using Hybrid IoU & Centroid Proximity."""
         if self.smooth_box is None:
             return None
         now = time.time()
@@ -422,12 +422,33 @@ class YoloDetectorNode(Node):
         if now - self.lock_lost_since > self.lock_reacquire_s:
             return None
 
-        best, best_iou = None, 0.0
+        ref_x1, ref_y1, ref_x2, ref_y2 = self.smooth_box
+        ref_cx, ref_cy = (ref_x1 + ref_x2) / 2.0, (ref_y1 + ref_y2) / 2.0
+        ref_w = max(1.0, ref_x2 - ref_x1)
+        ref_h = max(1.0, ref_y2 - ref_y1)
+
+        best, best_score, best_iou = None, -1.0, 0.0
         for cand in cands:
             iou = self._iou(self.smooth_box, cand[1:5])
-            if iou > best_iou:
-                best, best_iou = cand, iou
-        if best is None or best_iou < self.reacquire_min_iou:
+            c_x1, c_y1, c_x2, c_y2 = cand[1:5]
+            c_cx, c_cy = (c_x1 + c_x2) / 2.0, (c_y1 + c_y2) / 2.0
+
+            # Normalized Euclidean distance relative to box dimensions
+            dist_x = abs(c_cx - ref_cx) / max(ref_w, 30.0)
+            dist_y = abs(c_cy - ref_cy) / max(ref_h, 30.0)
+            dist_norm = (dist_x ** 2 + dist_y ** 2) ** 0.5
+
+            proximity_score = max(0.0, 1.0 - dist_norm / 2.0)
+            hybrid_score = 0.60 * iou + 0.40 * proximity_score
+
+            # Accept if standard IoU is met OR spatial proximity is very close despite camera shift
+            is_valid = (iou >= self.reacquire_min_iou) or (dist_norm < 1.2 and proximity_score >= 0.45)
+            if is_valid and hybrid_score > best_score:
+                best = cand
+                best_score = hybrid_score
+                best_iou = iou
+
+        if best is None:
             return None
 
         old_id = self.manual_target_id
@@ -435,8 +456,8 @@ class YoloDetectorNode(Node):
         self.lock_lost_since = None
         self.n_id_remaps += 1
         self.get_logger().info(
-            '[YOLO] lock re-acquired: track id %s -> %s (IoU %.2f)'
-            % (old_id, self.manual_target_id, best_iou))
+            '[YOLO] lock re-acquired: track id %s -> %s (IoU %.2f, Hybrid %.2f)'
+            % (old_id, self.manual_target_id, best_iou, best_score))
         # Keep the arbiter and the HUD banner on the same id.
         out = Int32()
         out.data = int(self.manual_target_id)

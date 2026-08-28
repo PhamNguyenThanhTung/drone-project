@@ -4,107 +4,88 @@ Hệ thống bám đuổi mục tiêu thông minh thời gian thực (Autonomous
 
 ---
 
-## 1. Yêu cầu Hệ thống & Cài đặt Môi trường (Installation Guide)
+## 1. Hướng Dẫn Cài Đặt Nhanh (Quickstart & Onboarding Guide)
 
-### Yêu cầu nền tảng:
+### Yêu Cầu Nền Tảng:
 * **Hệ điều hành**: Ubuntu 22.04 LTS (Native hoặc WSL2 trên Windows 10/11)
 * **ROS 2**: ROS 2 Humble Desktop (`ros-humble-desktop`)
 * **Mô phỏng**: Gazebo Harmonic (`gz-sim8`, `ros-humble-ros-gz-bridge`)
-* **Flight Stack**: PX4-Autopilot (`v1.14` / `v1.15`)
-* **Python**: Python 3.10+ với PyTorch (GPU CUDA hoặc CPU)
+* **Flight Stack**: PX4-Autopilot (`v1.14` đến `v1.16.2`) tại thư mục `~/PX4-Autopilot` hoặc `../PX4-Autopilot`
+* **Python**: Python 3.10+ (GPU CUDA hoặc CPU)
 
-### Các bước cài đặt từ đầu (Setup Steps):
+### Cài Đặt Tự Động Chỉ Bằng 1 Lệnh (One-Click Setup):
 
 ```bash
-# 1. Cài đặt các gói phụ thuộc Python
-pip3 install --user ultralytics pymavlink mavsdk opencv-python kconfiglib jinja2 "empy<4" jsonschema pyyaml
-
-# 2. Biên dịch workspace ROS 2
-cd ~/drone-project/ros2_ws
-colcon build --symlink-install
-source install/setup.bash
-
-# 3. Tải QGroundControl AppImage (Nếu chưa có)
-curl -L -o ~/QGroundControl.AppImage https://github.com/mavlink/qgroundcontrol/releases/download/v5.1.3/QGroundControl-x86_64.AppImage
-chmod +x ~/QGroundControl.AppImage
+# Clone repo và chạy script thiết lập toàn bộ môi trường:
+cd ~/drone-project
+./scripts/setup_environment.sh
 ```
+
+Script sẽ tự động:
+1. Kiểm tra ROS 2 Humble và cài đặt các thư viện Python từ [`requirements.txt`](requirements.txt).
+2. Tự động áp dụng PX4 Airframe GPS Patch ([`patches/4021_gz_x500_flow_gps.patch`](patches/4021_gz_x500_flow_gps.patch)).
+3. Biên dịch workspace ROS 2 (`colcon build --symlink-install`).
+4. Chuẩn bị model weights YOLOv8n (`yolov8n.pt`).
 
 ---
 
-## 2. Khởi chạy Hệ thống (Single Command Launch)
+## 2. Khởi Chạy Hệ Thống & Kiểm Thử
 
-Chỉ cần chạy một script duy nhất:
-
+### 2.1 Khởi chạy toàn bộ hệ thống mô phỏng:
 ```bash
-cd ~/drone-project
 ./start_stack.sh
 ```
+* **Gazebo Harmonic**: Thế giới công viên mô phỏng với người đi bộ và Quadcopter `x500_flow`.
+* **Live Camera HUD**: Góc nhìn camera POV kèm YOLO Bounding Box, 50% Safe Zone, Minimap vệ tinh và HUD GPS trực tiếp.
+* **MotionArbiter**: Tự động ARM, leo lên $3.8\text{ m}$, kích hoạt chế độ **OFFBOARD** và bám mục tiêu.
 
-### Các thành phần sẽ tự động mở lên đồng thời:
-1. **Gazebo Harmonic 3D Simulation**: Thế giới công viên mô phỏng với người đi bộ và Quadcopter `x500`.
-2. **QGroundControl (QGC)**: Tự động kết nối UDP `14550`, hiển thị tọa độ GPS, la bàn, cao độ EKF2 và bản đồ vệ tinh.
-3. **Live Camera HUD (OpenCV POV)**: Cửa sổ hiển thị trực quan góc nhìn từ Drone với YOLO Bounding Box, 50% Safe Zone, thanh trạng thái State Machine, **minimap 25 m (Bắc hướng lên)** và **bảng GPS trực tiếp** (LAT/LON/ALT + khoảng cách tới HOME) ở góc trái — kiểu QGroundControl thu nhỏ ngay trên hình camera. Click vào minimap để gửi lệnh GOTO tới vị trí tương ứng.
-4. **MotionArbiter Node**: Tự động ARM động cơ, cất cánh lên $3.8\text{ m}$, kích hoạt chế độ **OFFBOARD** và bắt đầu bám đuổi mục tiêu.
-
-> **Về nhãn trên màn hình**: các box chỉ được gán nhãn `PERSON` / `PERSON [LOCK]` — **không hiển thị số track ID** vì ByteTrack cấp ID mới mỗi vài frame khi chạy CPU, số nhảy liên tục khiến tưởng như mất dấu. ID vẫn được quản lý nội bộ: khóa bị mất ID sẽ tự ghép lại với box chồng lên box cũ (IoU) trong 2.5 s.
+### 2.2 Chạy bộ kiểm thử hồi quy 5 kịch bản độc lập (Multi-Trial Regression):
+```bash
+python3 tests/px4/run_isolated_multi_trial.py
+```
+Tự động chạy và đánh giá 5 kịch bản biến thể (quay đầu 180°, quay đầu nhanh, rẽ trái, rẽ phải, tiến sát 2.2m) và xuất log CSV thô vào thư mục [`logs/`](logs/).
 
 ---
 
-## 3. Bảng Điều khiển Phím & Thao tác Chuột
-
-Tất cả thao tác điều khiển được tích hợp **trên cùng cửa sổ Camera POV**:
+## 3. Bảng Điều Khiển Phím & Thao Tác Chuột (Camera POV HUD)
 
 | Phím / Thao tác | Chức năng | Chuyển đổi State |
 | :--- | :--- | :--- |
-| **`W` / `S`** | Bay Tiến / Lùi ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
-| **`A` / `D`** | Bay Sang Trái / Phải ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
-| **`R` / `F`** | Bay Lên cao / Hạ xuống ($1.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
-| **`Q` / `E`** | Xoay mũi Trái / Phải ($\pm 0.45\text{ rad/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay) |
-| **`X`** | Phanh dừng khẩn cấp (Hover tại chỗ) | `MANUAL` (Vận tốc = 0) |
-| **Click Chuột trái vào người** | Khóa mục tiêu vừa click (cách chọn chính) | $\rightarrow$ `TRACKING` (Tự động bám) |
-| **Phím số `1`, `2`, `3`, `4`...** | Khóa mục tiêu theo ID nội bộ (không hiển thị trên màn hình) | $\rightarrow$ `TRACKING` (Tự động bám) |
-| **Phím `0` hoặc `SPACE`** | Hủy khóa mục tiêu (Bay treo tại chỗ) | $\rightarrow$ `STANDBY` (Hover) |
+| **`W` / `S`** | Bay Tiến / Lùi ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
+| **`A` / `D`** | Bay Sang Trái / Phải ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
+| **`R` / `F`** | Bay Lên cao / Hạ xuống ($1.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
+| **`Q` / `E`** | Xoay mũi Trái / Phải ($\pm 0.45\text{ rad/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
+| **`X`** | Phanh khẩn cấp (Hover tại chỗ) | `MANUAL` ($v = 0$) |
+| **Click Chuột trái vào người** | Khóa mục tiêu vừa click | $\rightarrow$ `TRACKING` (Tự động bám) |
+| **Phím `1` - `9`** | Khóa mục tiêu theo ID | $\rightarrow$ `TRACKING` (Tự động bám) |
+| **Phím `0` hoặc `SPACE`** | Hủy khóa mục tiêu (Bay treo tại chỗ) | $\rightarrow$ `STANDBY` (Hover EKF2) |
 
 ---
 
-## 4. Kiến trúc State Machine (`MotionArbiter`)
+## 4. Chuẩn Bị Bay Thật: Quy Trình Siết Tham Số An Toàn (Flight Safety Ladder)
 
-```
-               [ Click chuột / Phím 1-9 ]
-        +----------------------------------------+
-        |                                        |
-        v                                        |
-+---------------+     Phím lái (W/A/S/D...)     +---------------+
-|   TRACKING    | --------------------------->  |    MANUAL     |
-+---------------+                               +---------------+
-  |           ^                                   ^           |
-  | (0/SPACE  | (Click / 1-9)                     |           |
-  |  Timeout) |                                   |           |
-  v           |                                   | (W/A/S/D) |
-+---------------+                                 |           |
-|    STANDBY    | --------------------------------+           |
-+---------------+ --------------------------------------------+
-```
+> [!WARNING]
+> **Quy tắc an toàn sống còn**: Các tham số nới lỏng trong SITL (để chịu tải máy tính) **TUYỆT ĐỐI KHÔNG ĐƯỢC DÙNG** khi bay ngoài trời trên phần cứng thật!
 
-* **Zero-Latency Manual Override**: Khi drone đang tự động bay bám mục tiêu (`TRACKING`), ngay khi bạn bấm bất kỳ phím lái nào (`W/A/S/D`), quyền điều khiển sẽ chuyển ngay sang `MANUAL` trong vòng $< 10\text{ ms}$.
-* **Failsafe Watchdog**: Nếu mục tiêu bị mất dấu quá $4.0\text{s}$, drone tự động chuyển sang `STANDBY` (Hover an toàn tại chỗ) chứ không tự ý bay mất kiểm soát.
+Khi hệ thống mô phỏng đã hoàn toàn ổn định, cần thực hiện siết lại các tham số theo bảng dưới đây trước khi cắm pin bay thật:
 
----
+### 4.1 Bảng so sánh tham số SITL vs. Bay Thật (Safety Tuning Matrix)
 
-## 5. Mô phỏng thực tế và kiểm thử an toàn
+| Tham số / Failsafe | Giá trị trong Mô phỏng (SITL) | Giá trị khi Chuẩn bị Bay Thật | Ý nghĩa an toàn |
+| :--- | :---: | :---: | :--- |
+| `COM_OF_LOSS_T` | `5.0 s` (hấp thụ trễ CPU host) | **`1.0 s`** (hoặc `0.5 s`) | Thời gian tối đa cho phép mất luồng lệnh Offboard trước khi kích hoạt Failsafe (RTL/Land). |
+| `NAV_DLL_ACT` | `0` (Bỏ qua data link loss) | **`1` (Hold)** hoặc **`2` (RTL)** | Hành động khi mất kết nối telemetry với Ground Station / Remote Control. |
+| `COM_ARM_GCS_CHK` | `0` (Không bắt buộc GCS) | **`1` (Bắt buộc kết nối GCS)** | Đảm bảo phần mềm mặt đất (QGC) luôn giám sát trước khi cho phép ARM. |
+| `NAV_RCL_ACT` | `0` (Bỏ qua mất sóng RC) | **`2` (RTL)** | Tự động bay về điểm xuất phát nếu mất sóng tay điều khiển. |
+| `max_forward_speed` | `1.8 m/s` | **`1.0 - 1.2 m/s`** | Giới hạn tốc độ tiến tối đa trong các lần bay thực nghiệm ban đầu. |
+| `bottom_backup_speed` | `0.65 m/s` | **`0.50 m/s`** | Tốc độ lùi an toàn khi mục tiêu tiến sát camera. |
+| `GF_ACTION` | `0` (None) | **`1` (Hold)** hoặc **`2` (RTL)** | Kích hoạt hàng rào địa lý (Geofence) khống chế bán kính và trần bay tối đa. |
 
-World mặc định có gió ngang và nhiễu loạn. PX4 `x500_base` cung cấp nhiễu
-IMU/barometer cơ bản; profile `simulation/realism.yaml` bổ sung camera lag,
-frame loss, motion blur và fault injection có seed để test lặp lại được:
+### 4.2 Thang Đo Kiểm Thử An Toàn 5 Cấp (5-Gate Validation Ladder)
 
-```bash
-SIM_REALISM=1 COMPANION_CPUSET=0,1 YOLO_MAX_FPS=15 YOLO_IMGSZ=416 ./start_stack.sh
-python3 simulation/inject_failure.py gps off
-python3 simulation/inject_failure.py gps ok
-```
+1. **Gate 1 - SITL Regression**: Vượt qua toàn bộ 5 trial trong [`run_isolated_multi_trial.py`](tests/px4/run_isolated_multi_trial.py) và chạy thử `simulation/realism.yaml` (nhiễu gió, lag, drop frame).
+2. **Gate 2 - HIL (Hardware-In-the-Loop)**: Chạy Companion Computer thật kết nối với Flight Controller thật qua UART/USB.
+3. **Gate 3 - Propeller-less Bench Test (Tháo toàn bộ cánh quạt)**: Bật nguồn, kiểm tra ARM, chuyển mode Offboard, giả lập ngắt MAVLink và ngắt camera để xem FCU phản ứng đúng failsafe.
+4. **Gate 4 - Tethered Net Test (Dây an toàn độc lập)**: Buộc dây neo giới hạn độ cao trong lồng lưới bảo vệ, có công tắc ngắt khẩn cấp (Physical Kill-Switch) trên tay điều khiển RC.
+5. **Gate 5 - Geofence Outdoor Flight**: Bay thực địa trong khu vực được cấp phép với Geofence bán kính $30\text{ m}$ và trần bay $5\text{ m}$.
 
-Thông số khối lượng, quán tính, thrust curve và battery curve của drone thật
-phải được đo và điền vào `simulation/vehicle_profile.yaml`; project không giả
-định các giá trị này. Quy trình bắt buộc là SITL -> HIL -> test tháo cánh ->
-dây an toàn -> bay geofence. Chi tiết và điều kiện qua từng bước nằm trong
-`simulation/README.md`.

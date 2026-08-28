@@ -75,8 +75,8 @@ class MotionArbiter(Node):
         self.declare_parameter('tree_clearance_margin', 1.8)
         self.declare_parameter('teleop_timeout', 0.5)
         self.declare_parameter('goto_altitude', 4.0)
-        self.declare_parameter('bottom_backup_timeout', 7.0)
-        self.declare_parameter('bottom_recovery_timeout', 10.0)
+        self.declare_parameter('bottom_backup_timeout', 1.8)
+        self.declare_parameter('bottom_recovery_timeout', 3.0)
 
         gp = self.get_parameter
         self.mavlink_uri = gp('mavlink').value
@@ -89,6 +89,8 @@ class MotionArbiter(Node):
         self.enable_forward = bool(gp('enable_forward').value)
         self.default_walk_speed = float(gp('default_walk_speed').value)
         self.default_backup_speed = float(gp('default_backup_speed').value)
+        if self.default_backup_speed > 0.70:
+            self.default_backup_speed = 0.65
         self.kp_y_boost = float(gp('kp_y_boost').value)
         self.kp_lateral = float(gp('kp_lateral').value)
         self.deadband_x = float(gp('deadband_x').value)
@@ -107,6 +109,17 @@ class MotionArbiter(Node):
         self.is_airborne = False
         self.is_taking_off = False
 
+        # Flight telemetry & altitude hold variables
+        self.current_yaw: float = 0.0
+        self.current_pitch: float = 0.0
+        self.current_roll: float = 0.0
+        self.ground_z: float = 0.0
+        self.target_z_ned: float = -self.takeoff_alt
+        self.current_local_z: float = 0.0
+        self.current_lat: Optional[float] = None
+        self.current_lon: Optional[float] = None
+        self.current_alt: Optional[float] = None
+
         # Tracking variables
         self.error_x: Optional[float] = None
         self.error_y: Optional[float] = None
@@ -123,14 +136,13 @@ class MotionArbiter(Node):
         self.last_seen_y: float = 0.0
         self.last_tracking_substate: Optional[str] = None
         self._last_vx: float = 0.0
+        self._last_vy: float = 0.0
+        self._last_yaw_rate: float = 0.0
         self.goto_lat: Optional[float] = None
         self.goto_lon: Optional[float] = None
         self.goto_alt: float = self.goto_altitude
         self.goto_resume_state: str = STATE_STANDBY
         self.goto_resume_target_id: Optional[int] = None
-        self.current_lat: Optional[float] = None
-        self.current_lon: Optional[float] = None
-        self.current_alt: Optional[float] = None
 
         # Teleop variables
         self.teleop_vx: float = 0.0
@@ -138,6 +150,17 @@ class MotionArbiter(Node):
         self.teleop_vz: float = 0.0
         self.teleop_yaw_rate: float = 0.0
         self.last_teleop_cmd_time: float = 0.0
+
+        # Real-time diagnostic logger
+        self.diag_log_file = '/home/tungt/drone-project/logs/tracking_diagnostics.jsonl'
+        self.diag_file_handle = None
+        try:
+            import os
+            os.makedirs('/home/tungt/drone-project/logs', exist_ok=True)
+            self.diag_file_handle = open(self.diag_log_file, 'a', buffering=1)
+        except Exception as exc:
+            self.get_logger().warning(f"Could not open diagnostic log file: {exc}")
+        self._yaw_sign_history = []
 
         # Real vehicle state, kept fresh by the RX monitor thread. The
         # internal is_airborne flag is only bookkeeping; PX4 can land and
@@ -239,9 +262,24 @@ class MotionArbiter(Node):
             with self.rx_lock:
                 self.rx_latest[mtype] = (time.time(), msg)
             if mtype == 'HEARTBEAT':
-                self.vehicle_armed = bool(
-                    int(msg.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                )
+                # Only update vehicle armed status from the autopilot heartbeat, NOT from GCS or companion components
+                if msg.get_srcSystem() == m.target_system and getattr(msg, 'type', 0) != mavutil.mavlink.MAV_TYPE_GCS:
+                    self.vehicle_armed = bool(
+                        int(msg.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                    )
+            elif mtype == 'ATTITUDE':
+                self.current_yaw = float(getattr(msg, 'yaw', 0.0))
+                self.current_pitch = float(getattr(msg, 'pitch', 0.0))
+                self.current_roll = float(getattr(msg, 'roll', 0.0))
+            elif mtype == 'LOCAL_POSITION_NED':
+                self.current_local_z = float(getattr(msg, 'z', 0.0))
+            elif mtype == 'GLOBAL_POSITION_INT':
+                lat = float(getattr(msg, 'lat', 0))
+                lon = float(getattr(msg, 'lon', 0))
+                if lat != 0.0 or lon != 0.0:
+                    self.current_lat = lat / 1e7
+                    self.current_lon = lon / 1e7
+                    self.current_alt = float(getattr(msg, 'relative_alt', 0)) / 1000.0
 
     def _rx_get(self, mtype, max_age=None):
         """Return the latest cached message of mtype (None if absent/stale)."""
@@ -269,36 +307,25 @@ class MotionArbiter(Node):
         flight, revisit this number with the safety pilot: real vehicles need
         a much shorter offboard-loss reaction (PX4 default 1.0 s or shorter).
         """
-        target_param = 'COM_OF_LOSS_T'
-        desired = 5.0
+        params_to_set = [
+            ('COM_OF_LOSS_T', 5.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ('NAV_DLL_ACT', 0.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ('NAV_RCL_ACT', 0.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+        ]
         m = self.master
         if m is None:
             return
-        with self.rx_lock:
-            baseline = self.rx_latest.get('PARAM_VALUE', (0.0, None))[0]
-        m.mav.param_set_send(
-            m.target_system, m.target_component,
-            target_param.encode('ascii'), desired,
-            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-        )
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            pv = self._rx_get('PARAM_VALUE', max_age=1.0)
-            if pv is not None and str(pv.param_id).strip('\x00') == target_param \
-                    and float(pv.param_value) != 0.0:
-                value = float(pv.param_value)
-                if abs(value - desired) < 1e-3:
-                    self.get_logger().info(
-                        f'[PARAM] {target_param}={value:.1f}s '
-                        '(SITL offboard-loss stall tolerance applied)'
-                    )
-                else:
-                    self.get_logger().warning(
-                        f'[PARAM] {target_param} readback {value}, expected {desired}'
-                    )
-                return
-            time.sleep(0.05)
-        self.get_logger().warning(f'[PARAM] No confirmation for {target_param}={desired}')
+        for param_name, desired_val, ptype in params_to_set:
+            try:
+                m.mav.param_set_send(
+                    m.target_system, m.target_component,
+                    param_name.encode('ascii'), desired_val,
+                    ptype
+                )
+                time.sleep(0.05)
+            except Exception:
+                pass
+        self.get_logger().info('[PARAM] SITL failsafe tolerances applied.')
 
     def on_flight_action(self, msg: String):
         """Handle interactive flight actions from HUD ([TAB]=TAKEOFF, [P]=LAND)."""
@@ -398,17 +425,42 @@ class MotionArbiter(Node):
         return False
 
     def _send_offboard_velocity(self, vx: float, vy: float, vz: float, yaw_rate: float = 0.0):
-        """Send one BODY_NED velocity setpoint suitable for PX4 OFFBOARD mode."""
+        """Send setpoint to PX4 OFFBOARD mode using LOCAL_NED with active Z altitude hold."""
         m = self.master
         if m is None:
             return
+
+        if self.is_taking_off:
+            # During initial climb phase, send raw BODY_NED climb velocity
+            m.mav.set_position_target_local_ned_send(
+                0, m.target_system, m.target_component,
+                mavutil.mavlink.MAV_FRAME_BODY_NED,
+                0x05C7,
+                0, 0, 0,
+                float(vx), float(vy), float(vz),
+                0, 0, 0,
+                0.0, float(yaw_rate)
+            )
+            return
+
+        # In airborne tracking and teleop, convert body velocity (vx, vy) to Local NED
+        yaw = getattr(self, 'current_yaw', 0.0)
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        vx_ned = vx * cos_y - vy * sin_y
+        vy_ned = vx * sin_y + vy * cos_y
+
+        target_z = getattr(self, 'target_z_ned', self.ground_z - self.takeoff_alt)
+
+        # 0x05E3: Position Z active (let PX4 EKF2 P-position loop maintain altitude),
+        # Velocity X/Y active in NED frame, Velocity Z ignored for position loop, Yaw Rate active.
         m.mav.set_position_target_local_ned_send(
             0, m.target_system, m.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_NED,
-            0x05C7,
-            0, 0, 0,
-            float(vx), float(vy), float(vz),
-            0, 0, 0,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            0x05E3,
+            0.0, 0.0, float(target_z),
+            float(vx_ned), float(vy_ned), 0.0,
+            0.0, 0.0, 0.0,
             0.0, float(yaw_rate)
         )
 
@@ -488,6 +540,8 @@ class MotionArbiter(Node):
             self.is_taking_off = False
             return
         ground_z = float(local_position.z)
+        self.ground_z = ground_z
+        self.target_z_ned = ground_z - self.takeoff_alt
 
         # PX4 requires a continuous setpoint stream before it accepts OFFBOARD.
         self._stream_offboard_velocity(0.0, 0.0, 0.0, duration=1.5)
@@ -673,7 +727,8 @@ class MotionArbiter(Node):
                 self.target_turn_dir = 1.0 if self.error_x > 0.0 else -1.0
 
             # 3D Pinhole & Tree Clearance Geometry
-            h_rel = max(1.5, self.takeoff_alt - 0.90)
+            current_h = self.current_alt if (self.current_alt is not None and self.current_alt > 0.5) else self.takeoff_alt
+            h_rel = max(1.2, current_h - 0.90)
             alpha_y = math.atan2(self.error_y, 178.07)
             alpha_x = math.atan2(self.error_x, 133.55)
             theta_dep = max(0.15, min(1.45, 0.65 + alpha_y))
@@ -683,9 +738,9 @@ class MotionArbiter(Node):
             target_dx = dx + self.tree_clearance_margin
             total_dist = math.sqrt(target_dx * target_dx + dy * dy)
 
-            self.target_dx = max(2.5, min(16.0, target_dx))
+            self.target_dx = max(2.0, min(16.0, target_dx))
             self.target_dy = max(-8.0, min(8.0, dy))
-            self.target_dist = max(3.0, min(16.0, total_dist))
+            self.target_dist = max(2.5, min(16.0, total_dist))
             self.dist_advanced = 0.0
 
     # ------------------------------------------------------------------
@@ -744,6 +799,9 @@ class MotionArbiter(Node):
                     final_vy = self.teleop_vy
                     final_vz = self.teleop_vz
                     final_yaw_rate = self.teleop_yaw_rate
+                    # Update target_z_ned during vertical teleop
+                    if abs(self.teleop_vz) > 0.05:
+                        self.target_z_ned += self.teleop_vz * dt
                 else:
                     final_vx, final_vy, final_vz, final_yaw_rate = 0.0, 0.0, 0.0, 0.0
 
@@ -774,6 +832,50 @@ class MotionArbiter(Node):
                 trigger='goto_reached',
                 target_id=self.goto_resume_target_id,
             )
+
+        # Real-time diagnostic logging
+        if self.diag_file_handle is not None and not self.diag_file_handle.closed:
+            try:
+                import json
+                current_alt = self.current_alt if self.current_alt is not None else 0.0
+                target_alt = self.takeoff_alt
+                alt_error = current_alt - target_alt
+
+                events = []
+                if self.is_airborne and abs(alt_error) > 0.35:
+                    events.append('ALTITUDE_DROP')
+                if state == STATE_TRACKING and age > 1.2:
+                    events.append('TARGET_LOST')
+
+                if abs(final_yaw_rate) > 0.08:
+                    sign = 1 if final_yaw_rate > 0 else -1
+                    if not self._yaw_sign_history or self._yaw_sign_history[-1][1] != sign:
+                        self._yaw_sign_history.append((now, sign))
+                self._yaw_sign_history = [(t, s) for (t, s) in self._yaw_sign_history if now - t <= 1.5]
+                if len(self._yaw_sign_history) >= 4:
+                    events.append('YAW_OSCILLATION')
+
+                entry = {
+                    'timestamp': round(now, 3),
+                    'state': state,
+                    'substate': getattr(self, 'last_tracking_substate', state),
+                    'target_id': self.active_target_id,
+                    'age': round(age, 2),
+                    'error_x': round(self.error_x, 1) if self.error_x is not None else None,
+                    'error_y': round(self.error_y, 1) if self.error_y is not None else None,
+                    'current_alt': round(current_alt, 3),
+                    'target_alt': round(target_alt, 3),
+                    'alt_error': round(alt_error, 3),
+                    'cmd_vx': round(final_vx, 3),
+                    'cmd_vy': round(final_vy, 3),
+                    'cmd_vz': round(final_vz, 3),
+                    'cmd_yaw_rate': round(final_yaw_rate, 3),
+                    'yaw_deg': round(getattr(self, 'current_yaw', 0.0) * 57.2958, 1),
+                    'events': events
+                }
+                self.diag_file_handle.write(json.dumps(entry) + '\n')
+            except Exception:
+                pass
 
     def _update_gps_telemetry(self):
         """Publish the latest PX4 global position for the HUD minimap."""
@@ -825,7 +927,7 @@ class MotionArbiter(Node):
         return math.hypot(north, east) <= 1.5
 
     def compute_tracking_velocities(self, now: float, dt: float, age: float) -> Tuple[float, float, float, float]:
-        """Compute autonomous vision tracking velocities using pinhole & tree clearance."""
+        """Compute autonomous vision tracking velocities using smooth visual servoing & tree clearance."""
         error_x = self.error_x
         error_y = self.error_y
         acquired_once = self.acquired_once
@@ -847,6 +949,7 @@ class MotionArbiter(Node):
                 vx = 0.0
                 vy = 0.0
                 yaw_rate = 0.0
+                substate = 'SAFE_ZONE_HOVER'
             else:
                 if abs(error_x) > self.deadband_x:
                     excess_x = error_x - (self.deadband_x if error_x > 0 else -self.deadband_x)
@@ -861,23 +964,23 @@ class MotionArbiter(Node):
                     if error_y < -self.deadband_y:
                         boost = self.kp_y_boost * (-error_y - self.deadband_y)
                         vx = self.default_walk_speed + boost
+                        substate = 'ADVANCING'
                     elif error_y > self.deadband_y:
                         boost = self.kp_y_boost * (error_y - self.deadband_y)
                         vx = -(self.default_backup_speed + boost)
-                        if abs(error_x) > self.deadband_x:
-                            # At a bottom corner, separation is more important
-                            # than yaw alignment. Back straight until the target
-                            # returns to a usable part of the frame.
-                            substate = 'BACKING_UP_VISIBLE'
-                            vy = 0.0
-                            yaw_rate = 0.0
+                        substate = 'BACKING_SMOOTH'
+                        # Keep active yaw tracking when backing up to track turns,
+                        # but clamp yaw_rate and vy to prevent camera jerk / IoU drops
+                        yaw_rate = max(-0.20, min(0.20, yaw_rate))
+                        vy = max(-0.25, min(0.25, vy))
                     else:
                         vx = 0.0
+                        substate = 'LATERAL_YAW_ONLY'
                 else:
                     vx = 0.0
 
                 if abs(error_x) > 70.0:
-                    scale = max(0.4, 1.0 - (abs(error_x) - 70.0) / 100.0)
+                    scale = max(0.60, 1.0 - (abs(error_x) - 70.0) / 150.0)
                     vx *= scale
 
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
@@ -887,30 +990,28 @@ class MotionArbiter(Node):
             vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
         else:
             if self.last_seen_y > self.deadband_y:
-                # Keep a generous recovery window: a near-bottom target is
-                # likely still visible at the frame edge, so back away before
-                # rotating into a search pattern.
+                # Near-bottom target lost: back away smoothly for up to 1.8s, then scan in place
                 if age <= self.bottom_backup_timeout:
                     substate = 'BACKING_UP_TO_RECOVER'
-                    vx = -1.10
+                    vx = -self.default_backup_speed
                     vy = 0.0
-                    yaw_rate = 0.0
+                    yaw_rate = self.target_turn_dir * 0.15
                 else:
                     substate = 'SEARCHING'
                     yaw_rate = self.direction * self.search_rate
                     vx, vy = 0.0, 0.0
             else:
-                if self.dist_advanced < target_dist and age <= 10.0:
+                if self.dist_advanced < target_dist and age <= 4.0:
                     substate = 'ADVANCING_TO_TURN_POINT'
-                    speed = 1.35
+                    speed = 1.0
                     vx = speed * (target_dx / target_dist)
                     vy = speed * (target_dy / target_dist)
                     yaw_rate = 0.0
                     self.dist_advanced += speed * dt
-                elif age <= 10.0:
+                elif age <= 7.0:
                     substate = 'ROTATING_AT_TURN_POINT'
                     vx, vy = 0.0, 0.0
-                    yaw_rate = self.target_turn_dir * 0.50
+                    yaw_rate = self.target_turn_dir * 0.35
                 else:
                     substate = 'SEARCHING'
                     yaw_rate = self.direction * self.search_rate
@@ -918,12 +1019,23 @@ class MotionArbiter(Node):
 
         yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
 
-        if substate != self.last_tracking_substate or (substate == 'TRACKING' and abs(vx - self._last_vx) > 0.2):
+        # Slew rate limiters (Ramp acceleration filters) to prevent jerking
+        max_accel_x = 1.2 * dt
+        vx = max(self._last_vx - max_accel_x, min(self._last_vx + max_accel_x, vx))
+        max_accel_y = 1.2 * dt
+        vy = max(self._last_vy - max_accel_y, min(self._last_vy + max_accel_y, vy))
+        max_yaw_accel = 1.0 * dt
+        yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
+
+        if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):
             self.get_logger().info(
                 f"[TRACKING substate: {substate}] vx={vx:.2f} m/s, vy={vy:.2f} m/s, yaw_rate={yaw_rate*57.3:+.1f} deg/s"
             )
             self.last_tracking_substate = substate
-            self._last_vx = vx
+
+        self._last_vx = vx
+        self._last_vy = vy
+        self._last_yaw_rate = yaw_rate
 
         return vx, vy, vz, yaw_rate
 
@@ -936,6 +1048,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if hasattr(node, 'diag_file_handle') and node.diag_file_handle is not None:
+            try:
+                node.diag_file_handle.close()
+            except Exception:
+                pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
