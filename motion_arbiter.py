@@ -59,19 +59,19 @@ class MotionArbiter(Node):
         self.declare_parameter('mavlink', 'udpin:0.0.0.0:14540')
         self.declare_parameter('auto_takeoff', True)
         self.declare_parameter('takeoff_alt', 3.8)
-        self.declare_parameter('kp', 0.0120)
-        self.declare_parameter('max_rate', 1.40)
-        self.declare_parameter('search_rate', 0.85)
+        self.declare_parameter('kp', 0.0070)
+        self.declare_parameter('max_rate', 0.85)
+        self.declare_parameter('search_rate', 0.50)
         self.declare_parameter('lost_timeout', 2.5)
         self.declare_parameter('enable_forward', True)
         self.declare_parameter('default_walk_speed', 0.75)
-        self.declare_parameter('default_backup_speed', 0.60)
+        self.declare_parameter('default_backup_speed', 0.70)
         self.declare_parameter('kp_y_boost', 0.0050)
-        self.declare_parameter('kp_lateral', 0.0040)
-        self.declare_parameter('deadband_x', 20.0)
-        self.declare_parameter('deadband_y', 25.0)
+        self.declare_parameter('kp_lateral', 0.0035)
+        self.declare_parameter('deadband_x', 25.0)
+        self.declare_parameter('deadband_y', 30.0)
         self.declare_parameter('max_forward_speed', 1.35)
-        self.declare_parameter('min_forward_speed', -0.80)
+        self.declare_parameter('min_forward_speed', -0.90)
         self.declare_parameter('tree_clearance_margin', 1.8)
         self.declare_parameter('teleop_timeout', 0.5)
         self.declare_parameter('goto_altitude', 3.8)
@@ -937,6 +937,7 @@ class MotionArbiter(Node):
             # Bounding box size (distance) evaluation
             is_box_small = (self.area is not None and self.area > 50.0 and self.area < self.target_area_min)
             is_box_large = (self.area is not None and self.area > self.target_area_max)
+            is_approaching = (error_y > self.deadband_y or is_box_large)
 
             in_safe_zone = (
                 abs(error_x) <= self.deadband_x
@@ -951,51 +952,55 @@ class MotionArbiter(Node):
                 yaw_rate = 0.0
                 substate = 'SAFE_ZONE_HOVER'
             else:
+                # 1. Yaw tracking: keep target centered horizontally
                 if abs(error_x) > self.deadband_x:
                     excess_x = error_x - (self.deadband_x if error_x > 0 else -self.deadband_x)
                     yaw_rate = self.kp * excess_x
                     vy = self.kp_lateral * excess_x
-                    vy = max(-0.45, min(0.45, vy))
+                    vy = max(-0.35, min(0.35, vy))
                 else:
                     yaw_rate = 0.0
                     vy = 0.0
 
+                # 2. Distance regulation: Decide between BACKING UP vs ADVANCING
                 if self.enable_forward:
-                    if error_y < -self.deadband_y:
-                        # Person is high in frame -> advance forward
-                        boost = self.kp_y_boost * (-error_y - self.deadband_y)
-                        vx = self.default_walk_speed + boost
-                        substate = 'ADVANCING'
-                    elif is_box_small:
-                        # Person is centered but small in frame (too far away) -> actively close in!
-                        area_deficit = self.target_area_min - (self.area if self.area is not None else 0.0)
-                        boost = self.kp_area * max(0.0, area_deficit)
-                        vx = self.default_walk_speed + boost
-                        substate = 'ADVANCING_CLOSE_IN'
-                    elif error_y > self.deadband_y or is_box_large:
-                        # Person is too low in frame or box is very large -> back away smoothly
+                    if is_approaching:
+                        # SCENARIO A: Target is walking towards drone / getting close -> BACK UP
+                        # Crucial: Keep looking forward at approaching target while reversing. DO NOT spin 180°!
                         if error_y > self.deadband_y:
                             boost = self.kp_y_boost * (error_y - self.deadband_y)
                         else:
                             boost = self.kp_area * (self.area - self.target_area_max)
                         vx = -(self.default_backup_speed + boost)
                         substate = 'BACKING_SMOOTH'
-                        # Active yaw tracking during backing to keep camera centered on turns
+                        # Smooth yaw while backing to keep camera centered without spinning away
                         yaw_rate = max(-0.40, min(0.40, yaw_rate))
-                        vy = max(-0.30, min(0.30, vy))
+                        vy = max(-0.25, min(0.25, vy))
+
+                    elif error_y < -self.deadband_y:
+                        # SCENARIO B: Target is moving forward / high in frame -> ADVANCE
+                        boost = self.kp_y_boost * (-error_y - self.deadband_y)
+                        vx = self.default_walk_speed + boost
+                        substate = 'ADVANCING'
+                        # Only reduce forward speed when target makes a sharp turn (> 60px off center)
+                        if abs(error_x) > 60.0:
+                            scale = max(0.20, 1.0 - (abs(error_x) - 60.0) / 60.0)
+                            vx *= scale
+
+                    elif is_box_small:
+                        # SCENARIO C: Target is small in frame (too far away) -> CLOSE IN
+                        area_deficit = self.target_area_min - (self.area if self.area is not None else 0.0)
+                        boost = self.kp_area * max(0.0, area_deficit)
+                        vx = self.default_walk_speed + boost
+                        substate = 'ADVANCING_CLOSE_IN'
+                        if abs(error_x) > 60.0:
+                            scale = max(0.20, 1.0 - (abs(error_x) - 60.0) / 60.0)
+                            vx *= scale
                     else:
                         vx = 0.0
                         substate = 'LATERAL_YAW_ONLY'
                 else:
                     vx = 0.0
-
-                # Prioritize heading rotation: if target is off-center, stop forward advance so drone pivots directly to target
-                if abs(error_x) > 40.0:
-                    vx = 0.0
-                    substate = 'YAW_ALIGN_TURN'
-                elif abs(error_x) > 15.0:
-                    scale = max(0.0, 1.0 - (abs(error_x) - 15.0) / 25.0)
-                    vx *= scale
 
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
 
@@ -1003,27 +1008,37 @@ class MotionArbiter(Node):
             substate = 'WAITING_FOR_TARGET'
             vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
         else:
-            # Target was lost from view: STOP forward/lateral motion immediately so drone does not wander off
-            vx = 0.0
-            vy = 0.0
-            vz = 0.0
-            if age <= 2.5:
-                # Rotate briskly towards the last known direction (target_turn_dir) to scan and re-acquire target
+            # Target was lost from view:
+            # If target was approaching or near bottom, back up smoothly for 1.2s to re-capture in wide FOV
+            if self.last_seen_y > self.deadband_y and age <= 1.2:
+                substate = 'BACKING_UP_TO_RECOVER'
+                vx = -self.default_backup_speed * 0.70
+                vy = 0.0
+                vz = 0.0
+                yaw_rate = 0.0
+            elif age <= 2.5:
+                # Rotate towards last turn direction to scan
                 substate = 'RECOVERING_YAW_HEADING'
+                vx = 0.0
+                vy = 0.0
+                vz = 0.0
                 yaw_rate = self.target_turn_dir * self.search_rate
             else:
                 substate = 'SEARCHING_HOLD'
+                vx = 0.0
+                vy = 0.0
+                vz = 0.0
                 yaw_rate = 0.0
 
         yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
 
         # Slew rate limiters: gentle acceleration on XY to prevent pitch-induced altitude bobbing,
-        # fast acceleration on Yaw for crisp, immediate heading rotation
-        max_accel_x = 0.8 * dt
+        # smooth yaw acceleration to prevent sudden jerking
+        max_accel_x = 0.9 * dt
         vx = max(self._last_vx - max_accel_x, min(self._last_vx + max_accel_x, vx))
-        max_accel_y = 0.8 * dt
+        max_accel_y = 0.9 * dt
         vy = max(self._last_vy - max_accel_y, min(self._last_vy + max_accel_y, vy))
-        max_yaw_accel = 6.0 * dt
+        max_yaw_accel = 3.5 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
 
         if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):
