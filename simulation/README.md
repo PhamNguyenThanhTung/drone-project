@@ -42,3 +42,17 @@ For companion-computer parity, launch with a restricted CPU set and inference
 rate, for example `COMPANION_CPUSET=0,1 YOLO_MAX_FPS=15 YOLO_IMGSZ=416`.
 Use the target computer's real thermal/power mode or vendor tooling for GPU
 power and memory limits; those controls are hardware-specific.
+
+## PX4 checkout patch
+
+The project requires simulated GPS enabled for the `x500_flow` airframe. Apply
+the repository patch to a matching PX4 checkout before building SITL:
+
+```bash
+cd /path/to/PX4-Autopilot
+git apply /path/to/drone-project/patches/4021_gz_x500_flow_gps.patch
+make px4_sitl gz_x500_flow
+```
+
+The patch targets the stock PX4 `v1.16.2` airframe file. Use
+`git apply --check` first when applying it to another PX4 revision.
