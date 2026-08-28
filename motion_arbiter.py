@@ -58,25 +58,25 @@ class MotionArbiter(Node):
         # ROS 2 Parameters
         self.declare_parameter('mavlink', 'udpin:0.0.0.0:14540')
         self.declare_parameter('auto_takeoff', True)
-        self.declare_parameter('takeoff_alt', 4.0)
-        self.declare_parameter('kp', 0.0035)
-        self.declare_parameter('max_rate', 0.40)
-        self.declare_parameter('search_rate', 0.20)
-        self.declare_parameter('lost_timeout', 4.0)
+        self.declare_parameter('takeoff_alt', 3.8)
+        self.declare_parameter('kp', 0.0065)
+        self.declare_parameter('max_rate', 0.75)
+        self.declare_parameter('search_rate', 0.40)
+        self.declare_parameter('lost_timeout', 2.5)
         self.declare_parameter('enable_forward', True)
-        self.declare_parameter('default_walk_speed', 0.85)
-        self.declare_parameter('default_backup_speed', 0.75)
-        self.declare_parameter('kp_y_boost', 0.0070)
-        self.declare_parameter('kp_lateral', 0.0020)
-        self.declare_parameter('deadband_x', 20.0)
-        self.declare_parameter('deadband_y', 25.0)
-        self.declare_parameter('max_forward_speed', 1.8)
-        self.declare_parameter('min_forward_speed', -1.2)
+        self.declare_parameter('default_walk_speed', 0.75)
+        self.declare_parameter('default_backup_speed', 0.60)
+        self.declare_parameter('kp_y_boost', 0.0050)
+        self.declare_parameter('kp_lateral', 0.0035)
+        self.declare_parameter('deadband_x', 25.0)
+        self.declare_parameter('deadband_y', 30.0)
+        self.declare_parameter('max_forward_speed', 1.35)
+        self.declare_parameter('min_forward_speed', -0.80)
         self.declare_parameter('tree_clearance_margin', 1.8)
         self.declare_parameter('teleop_timeout', 0.5)
-        self.declare_parameter('goto_altitude', 4.0)
-        self.declare_parameter('bottom_backup_timeout', 1.8)
-        self.declare_parameter('bottom_recovery_timeout', 3.0)
+        self.declare_parameter('goto_altitude', 3.8)
+        self.declare_parameter('bottom_backup_timeout', 1.5)
+        self.declare_parameter('bottom_recovery_timeout', 2.5)
 
         gp = self.get_parameter
         self.mavlink_uri = gp('mavlink').value
@@ -89,8 +89,6 @@ class MotionArbiter(Node):
         self.enable_forward = bool(gp('enable_forward').value)
         self.default_walk_speed = float(gp('default_walk_speed').value)
         self.default_backup_speed = float(gp('default_backup_speed').value)
-        if self.default_backup_speed > 0.70:
-            self.default_backup_speed = 0.65
         self.kp_y_boost = float(gp('kp_y_boost').value)
         self.kp_lateral = float(gp('kp_lateral').value)
         self.deadband_x = float(gp('deadband_x').value)
@@ -431,10 +429,6 @@ class MotionArbiter(Node):
             return
 
         yaw = getattr(self, 'current_yaw', 0.0)
-        # Advance target yaw smoothly according to yaw_rate
-        target_yaw = yaw + yaw_rate * 0.10
-        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
-
         cos_y = math.cos(yaw)
         sin_y = math.sin(yaw)
         vx_ned = vx * cos_y - vy * sin_y
@@ -443,16 +437,16 @@ class MotionArbiter(Node):
         ground_z = getattr(self, 'ground_z', 0.0)
         target_z = getattr(self, 'target_z_ned', ground_z - self.takeoff_alt)
 
-        # 0x01E3: Position Z active (PX4 EKF2 P-position loop maintains altitude),
-        # Velocity X/Y active in NED frame, Yaw angle and Yaw Rate both active for responsive turns.
+        # 0x05E3: Position Z active (PX4 EKF2 P-position loop maintains altitude),
+        # Velocity X/Y active in NED frame, Yaw Rate active with direct angular velocity authority.
         m.mav.set_position_target_local_ned_send(
             0, m.target_system, m.target_component,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0x01E3,
+            0x05E3,
             0.0, 0.0, float(target_z),
             float(vx_ned), float(vy_ned), 0.0,
             0.0, 0.0, 0.0,
-            float(target_yaw), float(yaw_rate)
+            0.0, float(yaw_rate)
         )
 
     def _stream_offboard_velocity(
@@ -945,7 +939,7 @@ class MotionArbiter(Node):
                     excess_x = error_x - (self.deadband_x if error_x > 0 else -self.deadband_x)
                     yaw_rate = self.kp * excess_x
                     vy = self.kp_lateral * excess_x
-                    vy = max(-0.4, min(0.4, vy))
+                    vy = max(-0.45, min(0.45, vy))
                 else:
                     yaw_rate = 0.0
                     vy = 0.0
@@ -959,18 +953,18 @@ class MotionArbiter(Node):
                         boost = self.kp_y_boost * (error_y - self.deadband_y)
                         vx = -(self.default_backup_speed + boost)
                         substate = 'BACKING_SMOOTH'
-                        # Keep active yaw tracking when backing up to track turns,
-                        # but clamp yaw_rate and vy to prevent camera jerk / IoU drops
-                        yaw_rate = max(-0.20, min(0.20, yaw_rate))
-                        vy = max(-0.25, min(0.25, vy))
+                        # Active yaw tracking during backing to keep camera centered on turns
+                        yaw_rate = max(-0.40, min(0.40, yaw_rate))
+                        vy = max(-0.30, min(0.30, vy))
                     else:
                         vx = 0.0
                         substate = 'LATERAL_YAW_ONLY'
                 else:
                     vx = 0.0
 
-                if abs(error_x) > 70.0:
-                    scale = max(0.60, 1.0 - (abs(error_x) - 70.0) / 150.0)
+                # Slow down forward speed when target is off-center to prioritize yaw alignment
+                if abs(error_x) > 40.0:
+                    scale = max(0.30, 1.0 - (abs(error_x) - 40.0) / 100.0)
                     vx *= scale
 
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
@@ -986,19 +980,20 @@ class MotionArbiter(Node):
             if age <= 2.5:
                 # Rotate towards the last known direction (target_turn_dir) to scan and bring target back into FOV
                 substate = 'RECOVERING_YAW_HEADING'
-                yaw_rate = self.target_turn_dir * 0.40
+                yaw_rate = self.target_turn_dir * 0.45
             else:
                 substate = 'SEARCHING_HOLD'
                 yaw_rate = 0.0
 
         yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
 
-        # Slew rate limiters (Ramp acceleration filters) to prevent jerking
-        max_accel_x = 1.2 * dt
+        # Slew rate limiters: gentle acceleration on XY to prevent pitch-induced altitude bobbing,
+        # fast acceleration on Yaw for crisp, immediate heading rotation
+        max_accel_x = 0.8 * dt
         vx = max(self._last_vx - max_accel_x, min(self._last_vx + max_accel_x, vx))
-        max_accel_y = 1.2 * dt
+        max_accel_y = 0.8 * dt
         vy = max(self._last_vy - max_accel_y, min(self._last_vy + max_accel_y, vy))
-        max_yaw_accel = 1.0 * dt
+        max_yaw_accel = 2.5 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
 
         if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):
