@@ -119,8 +119,12 @@ class YoloDetectorNode(Node):
         self.sub_click = self.create_subscription(
             Point, '/tracking/click_point', self.on_click_point, 10)
 
-        qos = QoSProfile(depth=2,
-                         reliability=ReliabilityPolicy.RELIABLE,
+        # Camera data is perishable.  A reliable queue can make inference
+        # process old frames after a brief GPU/ROS scheduling stall, producing
+        # delayed errors that destabilize the flight controller.  Keep only
+        # the newest frame and let the camera stream drop stale samples.
+        qos = QoSProfile(depth=1,
+                         reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(Image, self.image_topic, self.on_image, qos)
 

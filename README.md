@@ -39,6 +39,17 @@ Script sẽ tự động:
 * **Live Camera HUD**: Góc nhìn camera POV kèm YOLO Bounding Box, 50% Safe Zone, Minimap vệ tinh và HUD GPS trực tiếp.
 * **MotionArbiter**: Tự động ARM, leo lên $3.8\text{ m}$, kích hoạt chế độ **OFFBOARD** và bám mục tiêu.
 
+World mặc định là `person_tracking_path`: người đi bộ lặp toàn bộ tuyến đường lát
+trong công viên, bao gồm các đoạn rẽ và lượt quay về. Có thể chọn world khác bằng
+`WORLD_NAME=<tên_world> ./start_stack.sh`.
+
+QGroundControl (GCS) chạy trực tiếp trên Windows và kết nối tới MAVLink UDP
+14550 do PX4 SITL phát ra trong WSL. Mặc định WSL không khởi động QGC; để mở
+bản Windows từ script, chỉ định đường dẫn `.exe` đã mount vào WSL:
+`LAUNCH_QGC=1 QGC_WINDOWS_PATH=/mnt/c/Path/To/QGroundControl.exe ./start_stack.sh`.
+Bạn cũng có thể dùng biến tương thích `QGC_PATH` cho cùng đường dẫn. Khi
+`LAUNCH_QGC=0` (mặc định), hãy khởi động QGroundControl thủ công trên Windows.
+
 ### 2.2 Chạy bộ kiểm thử hồi quy 5 kịch bản độc lập (Multi-Trial Regression):
 ```bash
 python3 tests/px4/run_isolated_multi_trial.py
@@ -88,4 +99,3 @@ Khi hệ thống mô phỏng đã hoàn toàn ổn định, cần thực hiện 
 3. **Gate 3 - Propeller-less Bench Test (Tháo toàn bộ cánh quạt)**: Bật nguồn, kiểm tra ARM, chuyển mode Offboard, giả lập ngắt MAVLink và ngắt camera để xem FCU phản ứng đúng failsafe.
 4. **Gate 4 - Tethered Net Test (Dây an toàn độc lập)**: Buộc dây neo giới hạn độ cao trong lồng lưới bảo vệ, có công tắc ngắt khẩn cấp (Physical Kill-Switch) trên tay điều khiển RC.
 5. **Gate 5 - Geofence Outdoor Flight**: Bay thực địa trong khu vực được cấp phép với Geofence bán kính $30\text{ m}$ và trần bay $5\text{ m}$.
-

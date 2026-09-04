@@ -18,16 +18,21 @@ if [[ -f "${PROJECT_DIR}/ros2_ws/install/setup.bash" ]]; then
 fi
 
 export GZ_VERSION=harmonic
-# person_tracking_approach paces its actor 3-8 m ahead of the spawn point, so a
-# person is inside the 37 deg down-pitched camera's ground patch (~0.2-17 m)
-# right after takeoff. The older person_tracking_no_trees actor spends most of
-# its loop 20-30 m out, i.e. out of frame, which looks exactly like a broken
-# detector: no boxes, nothing to click. Override with WORLD_NAME=... if needed.
-export WORLD_NAME="${WORLD_NAME:-person_tracking_approach}"
+# person_tracking_path makes the actor repeat the complete paved walkway loop
+# (including turns and the return leg). Override with WORLD_NAME=... when a
+# focused camera or regression scenario is required.
+export WORLD_NAME="${WORLD_NAME:-person_tracking_path}"
 export PX4_GZ_WORLD="${WORLD_NAME}"
 export PX4_SIM_MODEL="${PX4_SIM_MODEL:-x500_flow}"
 export PX4_GZ_TARGET="${PX4_GZ_TARGET:-gz_${PX4_SIM_MODEL}}"
 export PX4_GZ_MODEL_NAME="${PX4_GZ_MODEL_NAME:-x500_0}"
+# WSL exposes the Windows host through the default route. Keep an explicit
+# override available for bridged networking or a manually selected host.
+export PX4_GCS_IP="${PX4_GCS_IP:-$(ip route 2>/dev/null | grep default | awk '{print $3}')}"
+# Keep the primary PX4 MAVLink instance discoverable by Windows QGroundControl.
+# This remains useful for PX4 builds whose startup scripts honor MAV_*_BROADCAST;
+# the explicit endpoint below handles WSL NAT where broadcast is not delivered.
+export PX4_PARAM_MAV_0_BROADCAST="${PX4_PARAM_MAV_0_BROADCAST:-1}"
 export GZ_SIM_RESOURCE_PATH="${PROJECT_DIR}/gazebo/models:${PROJECT_DIR}/gazebo/worlds:${PX4_DIR}/Tools/simulation/gz/models:${PX4_DIR}/Tools/simulation/gz/worlds:${GZ_SIM_RESOURCE_PATH:-}"
 export GZ_SIM_SERVER_CONFIG_PATH="${PX4_DIR}/src/modules/simulation/gz_bridge/server.config"
 export GZ_SIM_SYSTEM_PLUGIN_PATH="${PX4_DIR}/build/px4_sitl_default/src/modules/simulation/gz_plugins:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"
@@ -57,6 +62,7 @@ sleep 1
 cleanup() {
   if [[ -n "${GZ_PID:-}" ]]; then kill -TERM "$GZ_PID" 2>/dev/null || true; fi
   if [[ -n "${GZ_GUI_PID:-}" ]]; then kill -TERM "$GZ_GUI_PID" 2>/dev/null || true; fi
+  if [[ -n "${QGC_PID:-}" ]]; then kill -TERM "$QGC_PID" 2>/dev/null || true; fi
   pkill -TERM -f "QGroundControl" 2>/dev/null || true
   pkill -TERM -f "live_camera_hu[d]" 2>/dev/null || true
   pkill -TERM -f "motion_arbite[r]" 2>/dev/null || true
@@ -77,6 +83,76 @@ require_alive() {
     tail -20 "$log_file" >&2 || true
     exit 1
   fi
+}
+
+configure_windows_mavlink() {
+  local px4_bin_dir="${PX4_DIR}/build/px4_sitl_default/bin"
+  local mavlink_client="${px4_bin_dir}/px4-mavlink"
+
+  if [[ -z "${PX4_GCS_IP}" ]]; then
+    echo "WARNING: Không xác định được IP host Windows từ default route; bỏ qua MAVLink UDP 14550." >&2
+    return 1
+  fi
+  if [[ ! -x "${mavlink_client}" ]]; then
+    echo "WARNING: Không tìm thấy PX4 MAVLink client: ${mavlink_client}" >&2
+    return 1
+  fi
+
+  # PX4's POSIX rcS starts its default GCS instance on an internal port. Add a
+  # dedicated endpoint so telemetry is sent directly to Windows QGroundControl:
+  # mavlink start -x -u 14550 -r 4000000 -t "$PX4_GCS_IP"
+  echo "Cấu hình MAVLink GCS: UDP 14550 -> ${PX4_GCS_IP}:14550"
+  if ! PATH="${px4_bin_dir}:${PATH}" "${mavlink_client}" start \
+      -x -u 14550 -r 4000000 -t "${PX4_GCS_IP}" \
+      > /tmp/px4_gcs_mavlink.log 2>&1; then
+    echo "WARNING: PX4 không tạo được MAVLink endpoint tới ${PX4_GCS_IP}:14550." >&2
+    tail -20 /tmp/px4_gcs_mavlink.log >&2 || true
+    return 1
+  fi
+  return 0
+}
+
+launch_qgroundcontrol() {
+  # QGC runs on Windows in this setup.  WSL only launches it when explicitly
+  # requested with LAUNCH_QGC=1 and a Windows executable path.
+  if [[ "${LAUNCH_QGC:-0}" != "1" ]]; then
+    echo "QGroundControl: WSL launch disabled (use Windows QGC; LAUNCH_QGC=0)"
+    return 0
+  fi
+
+  local qgc_path="${QGC_WINDOWS_PATH:-${QGC_PATH:-}}"
+  local qgc_pid
+  local -a qgc_cmd
+  if [[ ! -f "${qgc_path}" ]]; then
+    echo "WARNING: Windows QGroundControl executable not found: ${qgc_path:-<unset>}" >&2
+    echo "         Set QGC_WINDOWS_PATH=/mnt/c/.../QGroundControl.exe" >&2
+    echo "         or set LAUNCH_QGC=0 and start QGC manually on Windows." >&2
+    return 0
+  fi
+  echo "Khởi động QGroundControl: ${qgc_path}"
+  qgc_cmd=("${qgc_path}")
+  if [[ "${qgc_path,,}" == *.appimage ]]; then
+    echo "ERROR: WSL QGroundControl AppImage is disabled; use the Windows .exe instead." >&2
+    QGC_PID=""
+    return 0
+  fi
+  "${qgc_cmd[@]}" > /tmp/qgc.log 2>&1 &
+  qgc_pid=$!
+  QGC_PID="${qgc_pid}"
+  sleep 2
+  if ! kill -0 "${qgc_pid}" 2>/dev/null; then
+    echo "ERROR: QGroundControl exited during startup." >&2
+    tail -30 /tmp/qgc.log >&2 || true
+    if rg -q 'GLIBC_|GLIBCXX_' /tmp/qgc.log 2>/dev/null; then
+      echo "         The AppImage is incompatible with this WSL runtime (current glibc: $(ldd --version 2>&1 | head -1))." >&2
+      echo "         Install a compatible QGC build, upgrade WSL, or use Windows QGC." >&2
+    fi
+    # QGC is a monitoring aid; keep the flight stack usable when its GUI
+    # binary cannot run, but make the failure explicit in the console/log.
+    QGC_PID=""
+    return 0
+  fi
+  echo "QGroundControl started (PID ${qgc_pid}); visual map/GCS is available."
 }
 
 if [[ "${USE_SOFTWARE_RENDERING:-0}" == "1" ]]; then
@@ -101,6 +177,20 @@ fi
 PX4_PID=$!
 sleep 10
 require_alive "$PX4_PID" "PX4 SITL + Gazebo" /tmp/px4_sim.log
+MAVLINK_FORWARDING_OK=0
+if configure_windows_mavlink; then
+  MAVLINK_FORWARDING_OK=1
+fi
+if [[ "${MAVLINK_FORWARDING_OK}" == "1" ]]; then
+  echo "MAVLink GCS telemetry: UDP 14550 -> ${PX4_GCS_IP}:14550 (Windows QGroundControl)."
+elif [[ -z "${PX4_GCS_IP}" ]] && rg -q 'remote port 14550' /tmp/px4_sim.log 2>/dev/null; then
+  echo "MAVLink GCS telemetry: UDP remote port 14550 (PX4 startup endpoint)."
+else
+  echo "WARNING: PX4 chưa xác nhận MAVLink endpoint UDP 14550." >&2
+fi
+if [[ "${MAVLINK_FORWARDING_OK}" != "1" ]] && rg -q 'MAVLink only on localhost' /tmp/px4_sim.log 2>/dev/null; then
+  echo "WARNING: PX4 reports MAVLink as localhost-only; check MAV_0_BROADCAST in PX4." >&2
+fi
 
 echo "[2/5] Khởi động ROS 2 parameter bridge..."
 # Bridge cho Camera Image
@@ -169,12 +259,7 @@ ARBITER_PID=$!
 sleep 2
 require_alive "$ARBITER_PID" "MotionArbiter" /tmp/motion_arbiter.log
 
-QGC_PATH="${QGC_PATH:-${PROJECT_DIR}/../QGroundControl.AppImage}"
-if [[ "${LAUNCH_QGC:-1}" == "1" ]] && [ -x "${QGC_PATH}" ]; then
-  echo "Tự động khởi động QGroundControl..."
-  "${QGC_PATH}" > /tmp/qgc.log 2>&1 &
-  sleep 1
-fi
+launch_qgroundcontrol
 
 if [[ "${SHOW_HUD:-1}" == "1" ]]; then
   echo "Mở cửa sổ camera YOLO & HUD..."
@@ -187,7 +272,11 @@ fi
 
 echo "======================================================="
 echo "   PX4 AUTOPILOT + GAZEBO HARMONIC SẴN SÀNG!            "
-echo "   QGroundControl đang chạy và tự động kết nối UDP 14550"
+if [[ -n "${QGC_PID:-}" ]] && kill -0 "${QGC_PID}" 2>/dev/null; then
+  echo "   QGroundControl đang chạy và tự động kết nối UDP 14550"
+else
+  echo "   QGroundControl chưa chạy (xem cảnh báo ở trên)"
+fi
 echo "======================================================="
 echo "Nhấn Ctrl-C để dừng toàn bộ stack."
 wait

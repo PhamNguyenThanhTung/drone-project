@@ -373,27 +373,68 @@
         <delay_start>5.0</delay_start>
         <auto_start>true</auto_start>
         <trajectory id="0" type="walk">
-          <!-- Approach-test path: paces 3-8 m ahead of the drone spawn
-               (origin, facing +X) so the person stays inside the camera
-               FOV for the entire loop. Used by tests/px4/test_approach_camera.py -->
+          <!-- Tricky tracking path: bounded zig-zag, pauses, sharp turns and
+               near-camera reversals.  The actor remains roughly 3-8 m ahead
+               of the spawn point so the camera can reacquire it after each
+               maneuver.  One loop is 37 s. -->
           <waypoint>
             <time>0.0</time>
             <pose>8.0 0.5 0.8891414 0 0 3.14159</pose>
           </waypoint>
           <waypoint>
-            <time>6.0</time>
-            <pose>3.0 0.5 0.8891414 0 0 3.14159</pose>
+            <time>4.0</time>
+            <pose>5.5 0.5 0.8891414 0 0 3.14159</pose>
           </waypoint>
           <waypoint>
-            <time>7.0</time>
+            <time>5.0</time>
+            <pose>5.5 0.5 0.8891414 0 0 0.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>8.0</time>
             <pose>3.0 0.5 0.8891414 0 0 0.0</pose>
           </waypoint>
           <waypoint>
-            <time>13.0</time>
-            <pose>8.0 0.5 0.8891414 0 0 0.0</pose>
+            <time>9.0</time>
+            <pose>3.0 0.5 0.8891414 0 0 3.14159</pose>
           </waypoint>
           <waypoint>
             <time>14.0</time>
+            <pose>6.0 -1.0 0.8891414 0 0 -2.8</pose>
+          </waypoint>
+          <waypoint>
+            <time>16.0</time>
+            <pose>6.0 -1.0 0.8891414 0 0 0.3</pose>
+          </waypoint>
+          <waypoint>
+            <time>20.0</time>
+            <pose>3.2 -1.0 0.8891414 0 0 0.3</pose>
+          </waypoint>
+          <waypoint>
+            <time>21.0</time>
+            <pose>3.2 -1.0 0.8891414 0 0 -2.8</pose>
+          </waypoint>
+          <waypoint>
+            <time>25.0</time>
+            <pose>5.0 1.5 0.8891414 0 0 -2.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>27.0</time>
+            <pose>5.0 1.5 0.8891414 0 0 1.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>31.0</time>
+            <pose>7.5 0.5 0.8891414 0 0 1.0</pose>
+          </waypoint>
+          <waypoint>
+            <time>32.0</time>
+            <pose>7.5 0.5 0.8891414 0 0 -2.1</pose>
+          </waypoint>
+          <waypoint>
+            <time>36.0</time>
+            <pose>8.0 0.5 0.8891414 0 0 -2.1</pose>
+          </waypoint>
+          <waypoint>
+            <time>37.0</time>
             <pose>8.0 0.5 0.8891414 0 0 3.14159</pose>
           </waypoint>
         </trajectory>

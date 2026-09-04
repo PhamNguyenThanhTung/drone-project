@@ -60,23 +60,38 @@ class MotionArbiter(Node):
         self.declare_parameter('auto_takeoff', True)
         self.declare_parameter('takeoff_alt', 3.8)
         self.declare_parameter('kp', 0.0070)
+        # Keep recovery responsive without the abrupt spin used by the
+        # previous PX4 tuning.  The old ArduPilot controller was slower but
+        # held the target in view more reliably during a turn.
         self.declare_parameter('max_rate', 0.85)
-        self.declare_parameter('search_rate', 0.50)
-        self.declare_parameter('lost_timeout', 2.5)
+        self.declare_parameter('search_rate', 0.55)
+        self.declare_parameter('lost_timeout', 3.5)
+        # A camera message older than this is no longer useful for visual
+        # servoing.  Keeping the old 1.2 s hold made the vehicle act on stale
+        # pixel errors while the target had already moved or disappeared.
+        self.declare_parameter('vision_fresh_timeout', 0.40)
         self.declare_parameter('enable_forward', True)
-        self.declare_parameter('default_walk_speed', 0.75)
-        self.declare_parameter('default_backup_speed', 0.70)
+        self.declare_parameter('default_walk_speed', 0.65)
+        self.declare_parameter('default_backup_speed', 0.60)
         self.declare_parameter('kp_y_boost', 0.0050)
         self.declare_parameter('kp_lateral', 0.0035)
         self.declare_parameter('deadband_x', 25.0)
         self.declare_parameter('deadband_y', 30.0)
-        self.declare_parameter('max_forward_speed', 1.35)
-        self.declare_parameter('min_forward_speed', -0.90)
+        self.declare_parameter('max_forward_speed', 1.15)
+        self.declare_parameter('min_forward_speed', -0.80)
         self.declare_parameter('tree_clearance_margin', 1.8)
         self.declare_parameter('teleop_timeout', 0.5)
         self.declare_parameter('goto_altitude', 3.8)
-        self.declare_parameter('bottom_backup_timeout', 1.5)
+        # Brief reverse recovery when a target leaves through the lower edge.
+        # Turning immediately can point the camera away from a person who is
+        # still directly ahead and only needs a little separation.
+        self.declare_parameter('bottom_backup_timeout', 1.4)
         self.declare_parameter('bottom_recovery_timeout', 2.5)
+        # When a target disappears laterally, briefly follow the last known
+        # ground-relative vector before rotating.  This restores the old
+        # turn-point behavior with bounded speed and duration.
+        self.declare_parameter('turn_point_timeout', 3.2)
+        self.declare_parameter('turn_point_speed', 0.75)
         self.declare_parameter('target_area_min', 6000.0)
         self.declare_parameter('target_area_max', 13000.0)
         self.declare_parameter('kp_area', 0.00015)
@@ -89,6 +104,7 @@ class MotionArbiter(Node):
         self.max_rate = abs(float(gp('max_rate').value))
         self.search_rate = abs(float(gp('search_rate').value))
         self.lost_timeout = float(gp('lost_timeout').value)
+        self.vision_fresh_timeout = max(0.10, float(gp('vision_fresh_timeout').value))
         self.enable_forward = bool(gp('enable_forward').value)
         self.default_walk_speed = float(gp('default_walk_speed').value)
         self.default_backup_speed = float(gp('default_backup_speed').value)
@@ -103,9 +119,12 @@ class MotionArbiter(Node):
         self.goto_altitude = float(gp('goto_altitude').value)
         self.bottom_backup_timeout = float(gp('bottom_backup_timeout').value)
         self.bottom_recovery_timeout = float(gp('bottom_recovery_timeout').value)
+        self.turn_point_timeout = max(0.5, float(gp('turn_point_timeout').value))
+        self.turn_point_speed = max(0.0, float(gp('turn_point_speed').value))
         self.target_area_min = float(gp('target_area_min').value)
         self.target_area_max = float(gp('target_area_max').value)
         self.kp_area = float(gp('kp_area').value)
+        self._distance_mode = 'neutral'
 
         # State Machine (Default: STANDBY - waits for user click/key before tracking)
         self.current_state = STATE_STANDBY
@@ -775,7 +794,7 @@ class MotionArbiter(Node):
                     self.set_state(STATE_STANDBY, trigger='vehicle_disarm_detected', target_id=None)
                     state = self.current_state
 
-            effective_lost_timeout = 2.5
+            effective_lost_timeout = self.lost_timeout
             if state == STATE_TRACKING and self.acquired_once and age > effective_lost_timeout:
                 self.get_logger().info(
                     f'[TRACKING] Target lost for {age:.1f}s (> {effective_lost_timeout}s) -> Returning to STANDBY hover.'
@@ -931,19 +950,35 @@ class MotionArbiter(Node):
         yaw_rate = 0.0
         substate = 'TRACKING'
 
-        if error_x is not None and age <= 1.2:
+        vision_fresh = error_x is not None and age <= self.vision_fresh_timeout
+        if vision_fresh:
             self.dist_advanced = 0.0
 
             # Bounding box size (distance) evaluation
             is_box_small = (self.area is not None and self.area > 50.0 and self.area < self.target_area_min)
             is_box_large = (self.area is not None and self.area > self.target_area_max)
-            is_approaching = (error_y > self.deadband_y or is_box_large)
+            # Use a small release hysteresis on box size so noisy detections
+            # do not alternate between advancing and backing every frame.
+            large_area_release = self.target_area_max * 0.90
+            if self._distance_mode == 'approaching':
+                area_large_for_control = (
+                    self.area is not None and self.area > large_area_release
+                )
+            else:
+                area_large_for_control = is_box_large
+            is_approaching = (error_y > self.deadband_y or area_large_for_control)
+            if is_approaching:
+                self._distance_mode = 'approaching'
+            elif error_y < -self.deadband_y or is_box_small:
+                self._distance_mode = 'advancing'
+            else:
+                self._distance_mode = 'neutral'
 
             in_safe_zone = (
                 abs(error_x) <= self.deadband_x
                 and abs(error_y) <= self.deadband_y
                 and not is_box_small
-                and not is_box_large
+                and not area_large_for_control
             )
 
             if in_safe_zone:
@@ -991,7 +1026,10 @@ class MotionArbiter(Node):
                         # SCENARIO C: Target is small in frame (too far away) -> CLOSE IN
                         area_deficit = self.target_area_min - (self.area if self.area is not None else 0.0)
                         boost = self.kp_area * max(0.0, area_deficit)
-                        vx = self.default_walk_speed + boost
+                        # Closing distance is deliberately slower than normal
+                        # pursuit; a centered target may be turning and needs
+                        # room for the controller to stop.
+                        vx = min(0.35, self.default_walk_speed + boost)
                         substate = 'ADVANCING_CLOSE_IN'
                         if abs(error_x) > 60.0:
                             scale = max(0.20, 1.0 - (abs(error_x) - 60.0) / 60.0)
@@ -1002,6 +1040,18 @@ class MotionArbiter(Node):
                 else:
                     vx = 0.0
 
+                # Taper pursuit speed as the target approaches the vertical
+                # center.  Without this, the controller held nearly full
+                # speed until the deadband and then had too much momentum to
+                # stop before the person turned or left the frame.
+                if vx > 0.0:
+                    if error_y < -self.deadband_y:
+                        center_margin = max(0.0, -error_y - self.deadband_y)
+                        speed_scale = max(0.25, min(1.0, center_margin / 80.0))
+                        vx *= speed_scale
+                    elif is_box_small:
+                        vx = min(vx, 0.25)
+
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
 
         elif not acquired_once:
@@ -1009,15 +1059,32 @@ class MotionArbiter(Node):
             vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
         else:
             # Target was lost from view:
-            # If target exited via the bottom of the frame (walked past underneath):
-            # Execute a clean, decisive 180-degree turnaround spin to face the walker!
-            if self.last_seen_y > self.deadband_y and age <= 2.2:
-                substate = 'TURNAROUND_180'
-                vx = 0.0
+            # If target exited via the bottom of the frame (walked past underneath),
+            # reverse far enough to widen the forward camera view before yawing.
+            if self.last_seen_y > self.deadband_y and age <= self.bottom_backup_timeout:
+                substate = 'BACKING_UP_TO_RECOVER'
+                # The target was at the lower edge immediately before the
+                # miss.  Reverse a short, capped distance with the camera
+                # still facing forward, then begin yaw recovery if needed.
+                vx = -min(0.55, self.default_backup_speed)
                 vy = 0.0
                 vz = 0.0
-                yaw_rate = self.target_turn_dir * 1.25
-            elif age <= 2.5:
+                yaw_rate = 0.0
+            elif (self.last_seen_y <= self.deadband_y
+                  and self.dist_advanced < target_dist
+                  and age <= self.turn_point_timeout):
+                # Lateral loss: follow the last known target vector toward the
+                # likely turn point, then rotate in place.  The speed cap and
+                # timeout prevent this fallback from becoming blind pursuit.
+                substate = 'ADVANCING_TO_TURN_POINT'
+                speed = min(self.turn_point_speed, self.max_forward_speed)
+                if target_dist > 1e-3:
+                    vx = speed * (target_dx / target_dist)
+                    vy = speed * (target_dy / target_dist)
+                self.dist_advanced += speed * dt
+                vz = 0.0
+                yaw_rate = 0.0
+            elif age <= self.lost_timeout:
                 # Target turned off-screen laterally: rotate towards turn direction to scan
                 substate = 'RECOVERING_YAW_HEADING'
                 vx = 0.0
@@ -1035,10 +1102,24 @@ class MotionArbiter(Node):
 
         # Slew rate limiters: gentle acceleration on XY to prevent pitch-induced altitude bobbing,
         # smooth yaw acceleration to prevent sudden jerking
-        max_accel_x = 0.9 * dt
-        vx = max(self._last_vx - max_accel_x, min(self._last_vx + max_accel_x, vx))
-        max_accel_y = 0.9 * dt
-        vy = max(self._last_vy - max_accel_y, min(self._last_vy + max_accel_y, vy))
+        # Brake faster after a vision timeout, while retaining slew limiting
+        # during normal tracking so camera noise cannot create jerks.
+        accel_x = 0.9
+        brake_x = 6.0 if not vision_fresh else 4.0
+        reducing_x = (
+            abs(vx) < abs(self._last_vx)
+            or (vx * self._last_vx < 0.0)
+        )
+        max_delta_x = (brake_x if reducing_x else accel_x) * dt
+        vx = max(self._last_vx - max_delta_x, min(self._last_vx + max_delta_x, vx))
+        accel_y = 0.9
+        brake_y = 6.0 if not vision_fresh else 4.0
+        reducing_y = (
+            abs(vy) < abs(self._last_vy)
+            or (vy * self._last_vy < 0.0)
+        )
+        max_delta_y = (brake_y if reducing_y else accel_y) * dt
+        vy = max(self._last_vy - max_delta_y, min(self._last_vy + max_delta_y, vy))
         max_yaw_accel = 3.5 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
 
