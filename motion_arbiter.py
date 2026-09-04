@@ -60,25 +60,25 @@ class MotionArbiter(Node):
         self.declare_parameter('auto_takeoff', True)
         self.declare_parameter('takeoff_alt', 3.8)
         self.declare_parameter('kp', 0.0070)
-        # Keep recovery responsive without the abrupt spin used by the
-        # previous PX4 tuning.  The old ArduPilot controller was slower but
-        # held the target in view more reliably during a turn.
-        self.declare_parameter('max_rate', 0.85)
-        self.declare_parameter('search_rate', 0.55)
+        # The person in person_tracking_path walks at approximately 1.11 m/s.
+        # These limits let the drone keep pace and complete a 90-degree turn
+        # in about one second, while the slew limiters still smooth commands.
+        self.declare_parameter('max_rate', 1.50)
+        self.declare_parameter('search_rate', 1.10)
         self.declare_parameter('lost_timeout', 3.5)
         # A camera message older than this is no longer useful for visual
         # servoing.  Keeping the old 1.2 s hold made the vehicle act on stale
         # pixel errors while the target had already moved or disappeared.
         self.declare_parameter('vision_fresh_timeout', 0.40)
         self.declare_parameter('enable_forward', True)
-        self.declare_parameter('default_walk_speed', 0.65)
-        self.declare_parameter('default_backup_speed', 0.60)
+        self.declare_parameter('default_walk_speed', 1.15)
+        self.declare_parameter('default_backup_speed', 1.10)
         self.declare_parameter('kp_y_boost', 0.0050)
         self.declare_parameter('kp_lateral', 0.0035)
         self.declare_parameter('deadband_x', 25.0)
         self.declare_parameter('deadband_y', 30.0)
-        self.declare_parameter('max_forward_speed', 1.15)
-        self.declare_parameter('min_forward_speed', -0.80)
+        self.declare_parameter('max_forward_speed', 1.80)
+        self.declare_parameter('min_forward_speed', -1.50)
         self.declare_parameter('tree_clearance_margin', 1.8)
         self.declare_parameter('teleop_timeout', 0.5)
         self.declare_parameter('goto_altitude', 3.8)
@@ -91,7 +91,7 @@ class MotionArbiter(Node):
         # ground-relative vector before rotating.  This restores the old
         # turn-point behavior with bounded speed and duration.
         self.declare_parameter('turn_point_timeout', 3.2)
-        self.declare_parameter('turn_point_speed', 0.75)
+        self.declare_parameter('turn_point_speed', 1.15)
         self.declare_parameter('target_area_min', 6000.0)
         self.declare_parameter('target_area_max', 13000.0)
         self.declare_parameter('kp_area', 0.00015)
@@ -1104,7 +1104,7 @@ class MotionArbiter(Node):
         # smooth yaw acceleration to prevent sudden jerking
         # Brake faster after a vision timeout, while retaining slew limiting
         # during normal tracking so camera noise cannot create jerks.
-        accel_x = 0.9
+        accel_x = 1.6
         brake_x = 6.0 if not vision_fresh else 4.0
         reducing_x = (
             abs(vx) < abs(self._last_vx)
@@ -1112,7 +1112,7 @@ class MotionArbiter(Node):
         )
         max_delta_x = (brake_x if reducing_x else accel_x) * dt
         vx = max(self._last_vx - max_delta_x, min(self._last_vx + max_delta_x, vx))
-        accel_y = 0.9
+        accel_y = 1.6
         brake_y = 6.0 if not vision_fresh else 4.0
         reducing_y = (
             abs(vy) < abs(self._last_vy)
@@ -1120,7 +1120,7 @@ class MotionArbiter(Node):
         )
         max_delta_y = (brake_y if reducing_y else accel_y) * dt
         vy = max(self._last_vy - max_delta_y, min(self._last_vy + max_delta_y, vy))
-        max_yaw_accel = 3.5 * dt
+        max_yaw_accel = 5.0 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
 
         if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):

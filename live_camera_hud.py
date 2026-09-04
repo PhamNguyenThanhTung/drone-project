@@ -76,7 +76,8 @@ class LiveCameraHUD(Node):
 
         self.teleop_speed = 2.0
         self.teleop_z_speed = 1.0
-        self.teleop_yaw_speed = 0.45
+        # Match autonomous tracking yaw responsiveness (about 1 s per 90 deg).
+        self.teleop_yaw_speed = 1.10
 
         self.get_logger().info(
             f"LiveCameraHUD ready on {topic_name}. Controls: [TAB/T]=Takeoff(4m), [P]=Land, "

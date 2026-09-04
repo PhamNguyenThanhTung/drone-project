@@ -65,7 +65,7 @@ Tự động chạy và đánh giá 5 kịch bản biến thể (quay đầu 180
 | **`W` / `S`** | Bay Tiến / Lùi ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
 | **`A` / `D`** | Bay Sang Trái / Phải ($2.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
 | **`R` / `F`** | Bay Lên cao / Hạ xuống ($1.0\text{ m/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
-| **`Q` / `E`** | Xoay mũi Trái / Phải ($\pm 0.45\text{ rad/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
+| **`Q` / `E`** | Xoay mũi Trái / Phải ($\pm 1.10\text{ rad/s}$) | $\rightarrow$ `MANUAL` (Can thiệp tay tức thì) |
 | **`X`** | Phanh khẩn cấp (Hover tại chỗ) | `MANUAL` ($v = 0$) |
 | **Click Chuột trái vào người** | Khóa mục tiêu vừa click | $\rightarrow$ `TRACKING` (Tự động bám) |
 | **Phím `1` - `9`** | Khóa mục tiêu theo ID | $\rightarrow$ `TRACKING` (Tự động bám) |
@@ -88,7 +88,7 @@ Khi hệ thống mô phỏng đã hoàn toàn ổn định, cần thực hiện 
 | `NAV_DLL_ACT` | `0` (Bỏ qua data link loss) | **`1` (Hold)** hoặc **`2` (RTL)** | Hành động khi mất kết nối telemetry với Ground Station / Remote Control. |
 | `COM_ARM_GCS_CHK` | `0` (Không bắt buộc GCS) | **`1` (Bắt buộc kết nối GCS)** | Đảm bảo phần mềm mặt đất (QGC) luôn giám sát trước khi cho phép ARM. |
 | `NAV_RCL_ACT` | `0` (Bỏ qua mất sóng RC) | **`2` (RTL)** | Tự động bay về điểm xuất phát nếu mất sóng tay điều khiển. |
-| `max_forward_speed` | `1.8 m/s` | **`1.0 - 1.2 m/s`** | Giới hạn tốc độ tiến tối đa trong các lần bay thực nghiệm ban đầu. |
+| `max_forward_speed` | `1.8 m/s` | **`1.0 - 1.2 m/s`** | Giới hạn tốc độ tiến tối đa trong mô phỏng; tốc độ bám danh định khoảng `1.15 m/s` để theo kịp người đi bộ. |
 | `bottom_backup_speed` | `0.65 m/s` | **`0.50 m/s`** | Tốc độ lùi an toàn khi mục tiêu tiến sát camera. |
 | `GF_ACTION` | `0` (None) | **`1` (Hold)** hoặc **`2` (RTL)** | Kích hoạt hàng rào địa lý (Geofence) khống chế bán kính và trần bay tối đa. |
 
