@@ -26,12 +26,21 @@
     <plugin filename="gz-sim-imu-system"
       name="gz::sim::systems::Imu">
     </plugin>
+    <!-- Required by PX4 preflight checks for compass and optical-flow data. -->
+    <plugin filename="gz-sim-magnetometer-system"
+      name="gz::sim::systems::Magnetometer">
+    </plugin>
     <!-- Required by PX4 GZBridge for the x500 barometer/EKF preflight check. -->
     <plugin filename="gz-sim-air-pressure-system"
       name="gz::sim::systems::AirPressure">
     </plugin>
     <plugin filename="gz-sim-navsat-system"
       name="gz::sim::systems::NavSat">
+    </plugin>
+    <!-- The x500_flow model's optical-flow sensor is handled by this project
+         plugin and bridged into PX4 for EKF2 horizontal estimation. -->
+    <plugin filename="libOpticalFlowSystem.so"
+      name="custom::OpticalFlowSystem">
     </plugin>
 
     <gravity>0 0 -9.8</gravity>
