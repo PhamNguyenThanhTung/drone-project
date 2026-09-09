@@ -17,7 +17,6 @@ thủ công từ Live Camera HUD.
 - [Cấu trúc repository](#cấu-trúc-repository)
 - [Yêu cầu môi trường](#yêu-cầu-môi-trường)
 - [Cài đặt](#cài-đặt)
-- [Kiểm tra GPU CUDA](#kiểm-tra-gpu-cuda)
 - [Khởi chạy](#khởi-chạy)
 - [Điều khiển Live HUD](#điều-khiển-live-hud)
 - [ROS 2 interfaces](#ros-2-interfaces)
@@ -35,7 +34,7 @@ thủ công từ Live Camera HUD.
 - Duy trì độ cao, khoảng cách và hướng nhìn trong các tình huống tiến gần,
   đi xa, rẽ ngang hoặc quay đầu.
 - Cho phép người vận hành giành quyền điều khiển tức thời bằng bàn phím.
-- Cung cấp môi trường SITL lặp lại được để đo hiệu năng, tái hiện lỗi và kiểm
+- Cung cấp môi trường SITL lặp lại được để tái hiện luồng vận hành, lỗi và kiểm
   tra failsafe trước khi làm việc với phần cứng thật.
 
 ### Thành phần chính
@@ -77,6 +76,11 @@ Luồng xử lý chính:
 5. PX4 nhận stream setpoint Offboard và điều khiển mô hình `x500_flow`.
 6. HUD hiển thị video, trạng thái, GPS, FPS và nhận lệnh từ người vận hành.
 
+Trong kiến trúc triển khai thật, drone truyền video tới server từ xa để suy luận;
+server chỉ gửi `target_id` và trạng thái mục tiêu ở tần số thấp. Companion
+computer trên drone vẫn chạy vòng `MotionArbiter` 10 Hz, gửi setpoint tới PX4 và
+thực thi watchdog/failsafe cục bộ khi video hoặc liên kết server bị mất.
+
 ## Cấu trúc repository
 
 ```text
@@ -110,8 +114,13 @@ drone-project/
 - Python 3.10 trở lên.
 - PX4-Autopilot v1.14 đến v1.16.2 tại `../PX4-Autopilot` hoặc đường dẫn được
   chỉ định bởi `PX4_DIR`.
-- NVIDIA GPU và CUDA-enabled PyTorch nếu chạy YOLO bằng GPU.
 - QGroundControl trên Windows nếu cần theo dõi telemetry/GCS.
+
+> Cấu hình CPU/GPU được dùng khi chạy local simulation chỉ là chi tiết của máy
+> đang chạy đồng thời PX4 SITL/Gazebo và YOLO, không phải thuộc tính của hệ thống
+> cuối cùng. Khi triển khai thật, drone truyền video tới companion/remote server
+> để suy luận; năng lực tính toán phía server là mối quan tâm tách biệt và nằm
+> ngoài phạm vi tài liệu này.
 
 ## Cài đặt
 
@@ -142,33 +151,9 @@ colcon build --symlink-install --packages-select vision_tracking
 source install/setup.bash
 ```
 
-## Kiểm tra GPU CUDA
-
-`start_stack.sh` ưu tiên `cuda:0` và sẽ dừng thay vì âm thầm fallback sang CPU.
-Chạy ba kiểm tra sau trước khi mở stack:
-
-```bash
-ls -l /dev/dxg
-/usr/lib/wsl/lib/nvidia-smi
-python3 -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
-```
-
-Kết quả cần có:
-
-- `/dev/dxg` tồn tại trong WSL2.
-- `nvidia-smi` nhìn thấy GPU.
-- `torch.cuda.is_available()` trả về `True`.
-
-Nếu WSL báo `GPU access blocked by the operating system`, cập nhật NVIDIA
-Windows driver, sau đó chạy trong PowerShell:
-
-```powershell
-wsl --update
-wsl --shutdown
-```
-
-Mở lại Ubuntu và chạy lại ba kiểm tra trên. Không đánh giá FPS GPU bằng
-`test_approach_camera.py`, vì test này cố ý đặt `device:=cpu` để cô lập regression.
+Thiết bị suy luận và các cờ môi trường của phiên SITL được mô tả trong
+`start_stack.sh`/tài liệu setup; chúng không đại diện cho kiến trúc triển khai
+cuối cùng.
 
 ## Khởi chạy
 
@@ -182,46 +167,13 @@ Mặc định hệ thống dùng:
 
 - World: `person_tracking_path`
 - Model: `x500_flow`
-- YOLO device: `cuda:0`
-- YOLO inference size: `640`
 - Takeoff altitude: `3.8 m`
 - HUD: bật
 - QGroundControl auto-launch: tắt
 
-### Cấu hình thường dùng
-
-```bash
-# Tăng tốc inference bằng ảnh 416 và ép CUDA
-YOLO_DEVICE=cuda:0 YOLO_IMGSZ=416 ./start_stack.sh
-
-# Chạy headless, không mở Gazebo GUI và HUD
-HEADLESS=1 SHOW_HUD=0 ./start_stack.sh
-
-# Bật mô phỏng delay, drop frame và sensor noise
-SIM_REALISM=1 ./start_stack.sh
-
-# Chọn world khác
-WORLD_NAME=person_tracking_approach ./start_stack.sh
-
-# Chạy CPU có chủ đích
-YOLO_DEVICE=cpu YOLO_IMGSZ=416 ./start_stack.sh
-```
-
-| Biến môi trường | Mặc định | Ý nghĩa |
-| --- | --- | --- |
-| `PX4_DIR` | `../PX4-Autopilot` | Đường dẫn PX4 checkout |
-| `WORLD_NAME` | `person_tracking_path` | Gazebo world |
-| `PX4_SIM_MODEL` | `x500_flow` | PX4/Gazebo model |
-| `YOLO_DEVICE` | `cuda:0` | Thiết bị inference |
-| `YOLO_IMGSZ` | `640` | Kích thước đầu vào YOLO |
-| `YOLO_MAX_FPS` | `0.0` | Giới hạn inference; `0` là không giới hạn |
-| `YOLO_CONF` | `0.45` | Confidence threshold |
-| `TAKEOFF_ALT` | `3.8` | Độ cao tự động cất cánh |
-| `HEADLESS` | `0` | Tắt Gazebo GUI khi bằng `1` |
-| `SHOW_HUD` | `1` | Bật debug image và HUD |
-| `SIM_REALISM` | `0` | Bật realism/fault injection |
-| `LAUNCH_QGC` | `0` | Mở QGC Windows từ WSL khi bằng `1` |
-| `COMPANION_CPUSET` | rỗng | Giới hạn CPU affinity để mô phỏng companion computer |
+Các tùy chọn world, realism, HUD và thiết bị chỉ là cờ của phiên mô phỏng; xem
+`start_stack.sh` hoặc tài liệu setup khi cần thay đổi, thay vì coi chúng là
+thành phần của luồng triển khai.
 
 Nhấn `Ctrl-C` tại terminal chạy `start_stack.sh` để dừng toàn bộ process do
 script tạo.
@@ -317,21 +269,23 @@ tail -f /tmp/yolo.log
 Trong log YOLO, `mean_latency=0.033s` tương đương xấp xỉ 30 inference/s.
 `det_rate` là tỷ lệ frame phát hiện được người, không phải FPS.
 
-### YOLO chạy CPU
+### Hai trial regression thất bại
 
-- Chạy trực tiếp `yolo_detector_node.py` sẽ dùng mặc định `cpu` nếu không truyền
-  `-p device:=cuda:0`.
-- `test_approach_camera.py` cố ý ép CPU.
-- `start_stack.sh` mặc định ép CUDA và dừng khi CUDA không khả dụng.
-- Xác nhận dòng đầu `/tmp/yolo.log` có `device=cuda:0` và tên GPU.
+Hai lần FAIL chủ yếu bắt nguồn từ logic trong `motion_arbiter.py`, không phải
+hiệu năng suy luận: `vz` bị hard-code `0.0` nên không có phản hồi độ cao, phép
+tính khoảng cách pinhole dùng hằng số độ cao lúc takeoff, còn các nhánh
+`BACKING_UP_VISIBLE` và `BACKING_UP_TO_RECOVER` khóa `yaw_rate`/`vy` hoặc lùi mù
+trong vài giây khi target mất hay rơi xuống nửa dưới khung hình. Camera bị rung,
+IoU YOLO giảm về 0 và track bị mất vĩnh viễn. CUDA/WSL chỉ là một caveat môi
+trường phụ cần ghi nhận khi tái hiện.
 
 ### Simulation chậm hoặc test thất bại ngẫu nhiên
 
 - Dừng các instance `px4`, `gz sim`, detector hoặc HUD còn sót.
 - Chạy test trên máy ít tải; wall-clock và simulation time có thể lệch khi CPU
   bị bão hòa.
-- Thử `HEADLESS=1 SHOW_HUD=0` để đo control/test độc lập với GUI.
-- Không đặt `COMPANION_CPUSET` hoặc `YOLO_MAX_FPS` khi đang đo hiệu năng tối đa.
+- Khi cần cô lập control khỏi GUI, dùng chế độ headless được mô tả trong
+  `start_stack.sh`.
 
 ### QGroundControl không kết nối
 

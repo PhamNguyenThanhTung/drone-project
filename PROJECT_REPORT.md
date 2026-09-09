@@ -18,11 +18,21 @@ dạng, điều khiển tự động, HUD tương tác, telemetry và QGroundCon
 bao phủ takeoff, landing, trục điều khiển, camera detection, target turnaround,
 đường dài nhiều góc rẽ, offboard-loss và năm kịch bản regression cô lập.
 
-Kết quả gần nhất của bộ five-trial regression là 3 PASS và 2 FAIL. Độ cao được
-giữ tương đối ổn định, nhưng tracking retention còn thấp và hệ thống chưa đạt
-độ tin cậy cần thiết cho phần cứng thật. Ngoài ra, GPU trong WSL phải được kiểm
-tra trước mỗi phiên chạy: khi CUDA không truy cập được, YOLO chạy CPU hoặc stack
-dừng, làm giảm FPS và có thể kéo giảm real-time factor của toàn bộ simulation.
+Kết quả gần nhất của bộ five-trial regression là 3 PASS và 2 FAIL. Hai trial
+thất bại chủ yếu do logic điều khiển trong `motion_arbiter.py`: `vz` trên trục
+đứng bị hard-code `0.0` (điều khiển hở vòng, không có phản hồi độ cao), phép tính
+khoảng cách pinhole dùng hằng số độ cao lúc takeoff thay vì độ cao thời gian
+thực, và các nhánh `BACKING_UP_VISIBLE`/`BACKING_UP_TO_RECOVER` khóa
+`yaw_rate` và `vy` về 0 hoặc lùi mù trong vài giây khi target mất hoặc trượt
+xuống nửa dưới khung hình. Chuyển động này làm rung camera, khiến IoU của YOLO
+giảm về 0 và mất track vĩnh viễn. CUDA/GPU trong WSL chỉ là yếu tố môi trường
+phụ, không phải nguyên nhân chính của hai lần thất bại.
+
+Cấu hình CPU/GPU hiện tại là hệ quả của việc một máy đang chạy đồng thời PX4
+SITL/Gazebo và YOLO, không phải thuộc tính của hệ thống cuối cùng. Khi triển
+khai thật, drone sẽ truyền video tới companion/remote server để suy luận; năng
+lực tính toán phía server là một mối quan tâm tách biệt, nằm ngoài phạm vi báo
+cáo này.
 
 ### Kết luận dành cho quản lý
 
@@ -32,7 +42,7 @@ dừng, làm giảm FPS và có thể kéo giảm real-time factor của toàn b
 - Đã có regression data, telemetry và failure-reproduction tests.
 - Chất lượng tracking chưa đạt tiêu chí phát hành: 2/5 trial đang FAIL.
 - Chưa có số liệu airframe thật cho mass, inertia, thrust curve và battery.
-- Bước tiếp theo phải tập trung vào tracking robustness, benchmark GPU ổn định,
+- Bước tiếp theo phải tập trung vào tracking robustness, sửa logic điều khiển,
   tiêu chí pass/fail rõ ràng và hoàn thành safety ladder.
 
 ## 2. Bối cảnh và bài toán
@@ -159,12 +169,22 @@ flowchart TB
 7. Tạo MAVLink endpoint tới QGroundControl trên Windows.
 8. Khởi động ROS-Gazebo camera bridge.
 9. Tùy chọn bật realism node.
-10. Kiểm tra CUDA rồi chạy YOLO detector.
+10. Khởi động YOLO detector.
 11. Chạy `MotionArbiter` và tự động takeoff.
 12. Tùy chọn chạy Live Camera HUD và QGroundControl.
 
 Nếu một process bắt buộc chết trong giai đoạn startup, script in log tương ứng
 và dừng thay vì tiếp tục với stack thiếu thành phần.
+
+### 4.2 Kiến trúc triển khai mục tiêu
+
+Trong triển khai thật, drone gửi luồng video lên server từ xa hoặc companion
+server để detector/tracker xử lý. Server chỉ gửi kết quả mục tiêu ở tần số thấp
+(ví dụ `target_id` và trạng thái nhìn thấy), còn companion computer trên drone
+duy trì vòng điều khiển `MotionArbiter` 10 Hz, phát setpoint Offboard tới PX4 và
+giữ các watchdog/failsafe cục bộ. Mất video, heartbeat hoặc liên kết server sẽ
+chuyển sang trạng thái tìm kiếm/giữ vị trí và kích hoạt failsafe theo chính sách
+đã cấu hình; manual override vẫn được ưu tiên tại chỗ.
 
 ## 5. Thiết kế từng phân hệ
 
@@ -210,8 +230,8 @@ Thông số mặc định quan trọng:
 | `reacquire_min_iou` | `0.15` | IoU tối thiểu cho một nhánh rebind |
 | `max_frame_rate` | `0` | Không giới hạn inference rate |
 
-Node có default `device=cpu` để chạy độc lập an toàn, nhưng full stack truyền
-`device=cuda:0` theo mặc định.
+Thiết bị suy luận là chi tiết của phiên SITL; các cờ cấu hình tương ứng xem
+`start_stack.sh` và tài liệu setup.
 
 ### 5.3 MotionArbiter
 
@@ -303,68 +323,9 @@ hoặc mô phỏng mất MAVLink signal.
 | MAVLink UDP 14540 | PX4 telemetry/control | MotionArbiter với PX4 SITL |
 | MAVLink UDP 14550 | GCS telemetry | PX4 với QGroundControl |
 
-## 7. Hiệu năng và sử dụng GPU
+## 7. Chiến lược kiểm thử
 
-### 7.1 Cấu hình dự kiến
-
-Full stack đặt `YOLO_DEVICE=cuda:0`. Trước khi chạy detector, script gọi
-`torch.cuda.is_available()`. Nếu CUDA không khả dụng, script dừng và yêu cầu sửa
-driver/WSL passthrough, không tự động chuyển sang CPU.
-
-Một log trước đó xác nhận hệ thống đã từng chạy trên:
-
-```text
-CUDA device available: cuda:0 (NVIDIA GeForce RTX 4060 Laptop GPU)
-Loading YOLO model [...] on device [cuda:0]
-mean_latency=0.033s
-```
-
-Latency `0.033 s` tương đương khoảng 30 inference/s sau giai đoạn warm-up.
-
-### 7.2 Trạng thái chẩn đoán ngày 09/09/2026
-
-Tại thời điểm tổng hợp báo cáo:
-
-```text
-torch.cuda.is_available() = False
-torch.cuda.device_count() = 0
-nvidia-smi: GPU access blocked by the operating system
-/dev/dxg: not found
-```
-
-PyTorch được build với CUDA nhưng WSL không được cấp thiết bị GPU. Đây là lỗi
-driver/WSL GPU passthrough, không phải lỗi YOLO model.
-
-Ngoài ra có hai đường chạy CPU có chủ đích:
-
-- Chạy trực tiếp node mà không truyền parameter sẽ dùng default `device=cpu`.
-- `tests/px4/test_approach_camera.py` cố ý truyền `device:=cpu`.
-
-### 7.3 Quy trình benchmark đề xuất
-
-```bash
-# 1. Xác nhận GPU
-/usr/lib/wsl/lib/nvidia-smi
-python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
-
-# 2. Chạy cấu hình benchmark
-YOLO_DEVICE=cuda:0 YOLO_IMGSZ=416 HEADLESS=1 SHOW_HUD=0 ./start_stack.sh
-
-# 3. Đo camera và output rate
-ros2 topic hz /camera/image_raw
-ros2 topic hz /tracking/debug_image
-
-# 4. Theo dõi latency
-tail -f /tmp/yolo.log
-```
-
-Cần ghi riêng camera FPS, YOLO inference latency, output topic FPS, Gazebo
-real-time factor, CPU usage và GPU utilization. FPS hiển thị trên HUD là tốc độ
-end-to-end của debug image, không chỉ là tốc độ YOLO.
-
-## 8. Chiến lược kiểm thử
-
-### 8.1 Các lớp kiểm thử
+### 7.1 Các lớp kiểm thử
 
 | Lớp | Nội dung |
 | --- | --- |
@@ -377,7 +338,7 @@ end-to-end của debug image, không chỉ là tốc độ YOLO.
 | Failure recovery | Offboard stream stall, autoland, disarm và re-takeoff |
 | Realism | Delay, drop frame, blur, sensor noise/dropout |
 
-### 8.2 Bộ five-trial regression
+### 7.2 Bộ five-trial regression
 
 Runner `tests/px4/run_isolated_multi_trial.py` tạo năm kịch bản độc lập:
 
@@ -390,7 +351,7 @@ Runner `tests/px4/run_isolated_multi_trial.py` tạo năm kịch bản độc l�
 Mỗi trial ghi raw CSV theo wall-clock time, altitude, yaw rate và tracking
 state. Summary được lưu trong `logs/multi_trial_summary.json`.
 
-### 8.3 Kết quả gần nhất
+### 7.3 Kết quả gần nhất
 
 | Trial | Altitude baseline | Min/Max trong maneuver | Drop | Tracking retention | Status |
 | ---: | ---: | ---: | ---: | ---: | --- |
@@ -400,7 +361,7 @@ state. Summary được lưu trong `logs/multi_trial_summary.json`.
 | 4 | `3.589 m` | `3.668 / 3.768 m` | `0.000 m` | `32.1%` | PASS |
 | 5 | `3.689 m` | `3.502 / 3.737 m` | `0.187 m` | `33.3%` | FAIL |
 
-### 8.4 Đánh giá kết quả
+### 7.4 Đánh giá kết quả
 
 Điểm tích cực:
 
@@ -420,11 +381,10 @@ state. Summary được lưu trong `logs/multi_trial_summary.json`.
 Kết luận: bộ test đã hữu ích cho regression, nhưng tiêu chí nghiệm thu cần được
 siết để PASS phản ánh cả flight stability và tracking continuity.
 
-## 9. Rủi ro và vấn đề đang mở
+## 8. Rủi ro và vấn đề đang mở
 
 | Mức độ | Rủi ro | Tác động | Hướng xử lý |
 | --- | --- | --- | --- |
-| Cao | WSL không nhìn thấy GPU | FPS thấp hoặc stack không khởi động | Sửa Windows driver/WSL, thêm preflight GPU report |
 | Cao | Tracking retention thấp | Mất target, lệnh tìm kiếm/recovery thường xuyên | FOV analysis, tune detector/tracker, temporal filtering |
 | Cao | 2/5 regression FAIL | Chưa đủ độ tin cậy | Root-cause từng trial, chạy lặp nhiều seed |
 | Cao | Chưa đo airframe thật | Model/control không đại diện drone thật | Bench measurement trước HIL |
@@ -435,16 +395,17 @@ siết để PASS phản ánh cả flight stability và tracking continuity.
 | Trung bình | Absolute paths trong logs | Khó chia sẻ CI/artifact | Xuất relative paths và metadata run |
 | Thấp | Package metadata còn placeholder | Giảm chất lượng release | Cập nhật version, maintainer và release notes |
 
-## 10. Kế hoạch phát triển đề xuất
+## 9. Kế hoạch phát triển đề xuất
 
-### Giai đoạn 1: Ổn định môi trường và benchmark
+### Giai đoạn 1: Ổn định luồng vận hành và regression
 
-- Khôi phục WSL CUDA và xác nhận RTX 4060 bằng `nvidia-smi`/PyTorch.
-- Tạo benchmark matrix CPU/CUDA, image size 416/640, HUD on/off.
-- Ghi P50/P95 latency, topic FPS, GPU utilization và Gazebo real-time factor.
-- Thêm run metadata: commit SHA, world, model, device và parameter set.
+- Chuẩn hóa chuỗi khởi động, telemetry và watchdog cho vòng điều khiển 10 Hz.
+- Chạy lại các scenario với seed, world và tải mô phỏng được ghi trong artifact.
+- Tách các chỉ số perception, control và safety để kết quả phản ánh đúng luồng end-to-end.
+- Thêm run metadata: commit SHA, world, model và parameter set.
 
-Điều kiện hoàn thành: benchmark lặp lại được và không còn mơ hồ CPU/GPU.
+Điều kiện hoàn thành: regression lặp lại được, log đủ để tái hiện và không còn
+điểm mù trong các watchdog/failsafe.
 
 ### Giai đoạn 2: Nâng tracking robustness
 
@@ -483,25 +444,25 @@ nominal configuration.
 - Có pilot RC và kill switch sẵn sàng can thiệp.
 - Chỉ mở rộng envelope sau khi log được review.
 
-## 11. Quy trình vận hành chuẩn
+## 10. Quy trình vận hành chuẩn
 
 ### Trước khi chạy
 
 ```bash
 git status --short
 source /opt/ros/humble/setup.bash
-python3 -c "import torch; print('CUDA:', torch.cuda.is_available())"
-/usr/lib/wsl/lib/nvidia-smi
 ```
 
-Xác nhận không có simulation cũ, PX4 checkout đúng version, GPU hoạt động và
-QGroundControl sẵn sàng nếu cần quan sát GCS.
+Xác nhận không có simulation cũ, PX4 checkout đúng version và QGroundControl
+sẵn sàng nếu cần quan sát GCS.
 
 ### Chạy demo
 
 ```bash
-YOLO_DEVICE=cuda:0 YOLO_IMGSZ=416 ./start_stack.sh
+./start_stack.sh
 ```
+
+Các cờ tùy chọn của phiên SITL được ghi trong `start_stack.sh` và tài liệu setup.
 
 ### Quan sát
 
@@ -518,7 +479,7 @@ Nhấn `Ctrl-C` tại terminal của `start_stack.sh`. Script gửi TERM tới c
 đã tạo. Sau khi dừng, kiểm tra không còn instance PX4/Gazebo cũ trước lần chạy
 tiếp theo.
 
-## 12. Safety ladder bắt buộc
+## 11. Safety ladder bắt buộc
 
 > [!CAUTION]
 > Không bỏ qua gate. Không gắn cánh quạt trong HIL/bench test. Không bay ngoài
@@ -541,7 +502,7 @@ Trước bay thật phải review lại ít nhất:
 - Maximum forward/backward/lateral/yaw rates
 - Battery failsafe và RTL behavior
 
-## 13. Hướng dẫn trình bày dự án
+## 12. Hướng dẫn trình bày dự án
 
 Một bài trình bày 10 đến 15 phút có thể đi theo thứ tự:
 
@@ -551,9 +512,10 @@ Một bài trình bày 10 đến 15 phút có thể đi theo thứ tự:
 4. **Điểm kỹ thuật:** target rebind, area-based distance, recovery substates,
    manual override và offboard failsafe handling.
 5. **Kết quả:** 3/5 trial PASS, altitude tương đối ổn định, retention còn thấp.
-6. **Vấn đề GPU:** CUDA phụ thuộc WSL passthrough; đã xác định cách kiểm tra.
+6. **Kiến trúc triển khai:** vòng điều khiển 10 Hz ở companion, server gửi target ID
+   tần số thấp, và failsafe vẫn cục bộ.
 7. **Rủi ro:** perception continuity, host load, airframe thật chưa được đo.
-8. **Kế hoạch:** benchmark, tracking robustness, regression, HIL, tethered test.
+8. **Kế hoạch:** sửa control logic, tracking robustness, regression, HIL, tethered test.
 9. **Thông điệp kết thúc:** nền tảng end-to-end đã có, nhưng cần tiếp tục validation
    trước khi chuyển từ demo nghiên cứu sang hệ thống bay thật.
 
@@ -561,9 +523,9 @@ Một bài trình bày 10 đến 15 phút có thể đi theo thứ tự:
 
 > Hệ thống đã chứng minh được luồng tự động bám người end-to-end trong PX4 SITL,
 > đồng thời có telemetry và regression tests để đo tiến bộ; ưu tiên tiếp theo là
-> tăng tracking continuity, ổn định GPU runtime và hoàn tất safety validation.
+> tăng tracking continuity, sửa logic điều khiển và hoàn tất safety validation.
 
-## 14. Tài liệu và artifact
+## 13. Tài liệu và artifact
 
 | Tài liệu/artifact | Nội dung |
 | --- | --- |
@@ -573,12 +535,12 @@ Một bài trình bày 10 đến 15 phút có thể đi theo thứ tự:
 | `logs/multi_trial_summary.json` | Summary của five-trial regression |
 | `logs/raw_trial_*.csv` | Telemetry thô từng trial |
 | `logs/tracking_diagnostics.jsonl` | Diagnostic events theo thời gian |
-| `/tmp/yolo.log` | Device, detection state và inference latency |
+| `/tmp/yolo.log` | Detection state và inference timing |
 | `/tmp/motion_arbiter.log` | State transition và command output |
 | `/tmp/px4_sim.log` | PX4 SITL startup/runtime |
 | `/tmp/gz_sim.log` | Gazebo server runtime |
 
-## 15. Trạng thái bàn giao
+## 14. Trạng thái bàn giao
 
 Tại ngày báo cáo:
 
@@ -586,8 +548,8 @@ Tại ngày báo cáo:
 - Full-stack launcher, environment setup và PX4 patch automation đã có.
 - README đã được tổ chức lại cho onboarding và vận hành.
 - Báo cáo này cung cấp bối cảnh quản lý, kiến trúc, kết quả, rủi ro và roadmap.
-- Hạng mục còn mở quan trọng nhất là CUDA/WSL runtime, tracking retention, hai
-  trial FAIL và validation cho airframe thật.
+- Hạng mục còn mở quan trọng nhất là control/tracking retention, hai trial FAIL
+  và validation cho airframe thật.
 
 Mọi quyết định chuyển sang HIL hoặc bay thật phải dựa trên log mới, tiêu chí
 nghiệm thu đã thống nhất và sign-off an toàn, không chỉ dựa trên demo trực quan.

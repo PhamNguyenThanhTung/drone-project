@@ -38,10 +38,10 @@ python3 simulation/inject_failure.py gps ok
 python3 simulation/inject_failure.py mavlink_signal off
 ```
 
-For companion-computer parity, launch with a restricted CPU set and inference
-rate, for example `COMPANION_CPUSET=0,1 YOLO_MAX_FPS=15 YOLO_IMGSZ=416`.
-Use the target computer's real thermal/power mode or vendor tooling for GPU
-power and memory limits; those controls are hardware-specific.
+Companion-computer parity and inference-rate controls are simulation-only test
+options; see `start_stack.sh` and the setup documentation when a constrained
+run is needed. Hardware thermal or power limits are deployment concerns outside
+this safety-test guide.
 
 ## PX4 checkout patch
 
