@@ -444,6 +444,41 @@ nominal configuration.
 - Có pilot RC và kill switch sẵn sàng can thiệp.
 - Chỉ mở rộng envelope sau khi log được review.
 
+### Giai đoạn 6: Chuyển từ mô phỏng sang hệ thống thực
+
+Giai đoạn này không phải là thay `x500_flow` bằng một airframe khác rồi chạy lại
+demo. Các giả định của SITL phải được thay bằng dữ liệu đo, driver thật và các
+đường liên kết có thể mất:
+
+- **Airframe và PX4:** đo mass, inertia, thrust curve, giới hạn tốc độ, mức tiêu
+  thụ và đặc tính pin; cập nhật actuator mapping, estimator, vibration filtering,
+  failsafe và geofence theo flight controller/airframe thật.
+- **Cảm biến và frame:** thay camera/GPS/IMU/barometer mô phỏng bằng driver thật;
+  hiệu chuẩn intrinsics/extrinsics, timestamp, trục tọa độ, độ trễ và chất lượng
+  tín hiệu trước khi dùng dữ liệu cho tracking hoặc altitude hold.
+- **Kiến trúc tính toán:** companion computer trên drone giữ vòng điều khiển
+  10 Hz, watchdog và manual override; server từ xa xử lý video và gửi
+  `target_id`/trạng thái ở tần số thấp. Phải đo bandwidth, latency, jitter,
+  mất gói và hành vi khi server hoặc video mất kết nối.
+- **Control và perception:** hiệu chỉnh lại dấu trục, setpoint altitude theo
+  phản hồi thời gian thực, phép tính khoảng cách theo altitude thực, giới hạn
+  tốc độ/yaw và các nhánh recovery. Không chuyển nguyên các ngưỡng/tốc độ SITL
+  sang airframe thật nếu chưa có dữ liệu bench và tethered test.
+- **Failsafe và vận hành:** kiểm tra độc lập mất RC, MAVLink, companion,
+  server/video, GPS, estimator và pin; xác nhận hệ thống giữ vị trí, hạ cánh,
+  RTL hoặc disarm đúng chính sách đã phê duyệt. RC pilot và kill switch phải có
+  quyền ưu tiên hơn tracking.
+- **Dữ liệu và giám sát:** thống nhất timestamp/log format giữa camera, server,
+  companion và PX4; ghi lại target ID, độ tuổi dữ liệu, setpoint, trạng thái
+  failsafe và nguyên nhân mất track để điều tra sau chuyến bay.
+
+Điều kiện go/no-go trước khi mở rộng envelope bay: HIL và bench không cánh đạt,
+mọi failure injection bắt buộc có phản ứng đúng, tethered flight đạt tiêu chí
+đã phê duyệt trong nhiều lần lặp, và checklist được pilot/safety reviewer ký
+duyệt. Bất kỳ thay đổi phần cứng, firmware, model detector hoặc đường truyền
+video nào đều phải quay lại bước kiểm thử tương ứng thay vì được xem là thay
+đổi cấu hình nhỏ.
+
 ## 10. Quy trình vận hành chuẩn
 
 ### Trước khi chạy
@@ -515,7 +550,8 @@ Một bài trình bày 10 đến 15 phút có thể đi theo thứ tự:
 6. **Kiến trúc triển khai:** vòng điều khiển 10 Hz ở companion, server gửi target ID
    tần số thấp, và failsafe vẫn cục bộ.
 7. **Rủi ro:** perception continuity, host load, airframe thật chưa được đo.
-8. **Kế hoạch:** sửa control logic, tracking robustness, regression, HIL, tethered test.
+8. **Kế hoạch:** sửa control logic, tracking robustness, regression, HIL, tethered
+   test và chuyển có kiểm soát sang airframe/đường truyền thực.
 9. **Thông điệp kết thúc:** nền tảng end-to-end đã có, nhưng cần tiếp tục validation
    trước khi chuyển từ demo nghiên cứu sang hệ thống bay thật.
 
@@ -548,8 +584,8 @@ Tại ngày báo cáo:
 - Full-stack launcher, environment setup và PX4 patch automation đã có.
 - README đã được tổ chức lại cho onboarding và vận hành.
 - Báo cáo này cung cấp bối cảnh quản lý, kiến trúc, kết quả, rủi ro và roadmap.
-- Hạng mục còn mở quan trọng nhất là control/tracking retention, hai trial FAIL
-  và validation cho airframe thật.
+- Hạng mục còn mở quan trọng nhất là control/tracking retention, hai trial FAIL,
+  validation airframe thật và kế hoạch chuyển tiếp theo các gate nêu trên.
 
 Mọi quyết định chuyển sang HIL hoặc bay thật phải dựa trên log mới, tiêu chí
 nghiệm thu đã thống nhất và sign-off an toàn, không chỉ dựa trên demo trực quan.
