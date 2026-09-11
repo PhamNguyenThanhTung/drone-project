@@ -85,6 +85,35 @@ require_alive() {
   fi
 }
 
+wait_for_ready() {
+  local name="$1"
+  local pid="$2"
+  local log_file="$3"
+  local timeout="$4"
+  local check_cmd="$5"
+
+  local start_t
+  start_t=$(date +%s)
+  while true; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "LỖI: $name (PID $pid) đã dừng đột ngột. Xem log: $log_file" >&2
+      tail -25 "$log_file" >&2 || true
+      exit 1
+    fi
+    if eval "$check_cmd" >/dev/null 2>&1; then
+      echo "  -> [READY] $name (PID $pid) đã sẵn sàng."
+      return 0
+    fi
+    local now_t
+    now_t=$(date +%s)
+    if (( now_t - start_t >= timeout )); then
+      echo "CẢNH BÁO: Quá thời gian chờ $timeout giây cho $name (PID $pid); tiếp tục với trạng thái degraded." >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+}
+
 configure_windows_mavlink() {
   local px4_bin_dir="${PX4_DIR}/build/px4_sitl_default/bin"
   local mavlink_client="${px4_bin_dir}/px4-mavlink"
@@ -166,8 +195,7 @@ echo "[1/5] Khởi động Gazebo Harmonic và PX4 Autopilot SITL..."
 # through GZ_SIM_RESOURCE_PATH, and PX4 attaches to the running world.
 gz sim -r -s "${PROJECT_DIR}/gazebo/worlds/${WORLD_NAME}.sdf" > /tmp/gz_sim.log 2>&1 &
 GZ_PID=$!
-sleep 5
-require_alive "$GZ_PID" "Gazebo Harmonic" /tmp/gz_sim.log
+wait_for_ready "Gazebo Harmonic (/clock)" "$GZ_PID" /tmp/gz_sim.log 20 "gz topic -l 2>/dev/null | grep -q '/clock'"
 if [[ "${HEADLESS:-0}" != "1" ]]; then
   gz sim -g > /tmp/gz_gui.log 2>&1 &
   GZ_GUI_PID=$!
@@ -175,8 +203,7 @@ fi
 
 (cd "${PX4_DIR}" && make px4_sitl "${PX4_GZ_TARGET}") > /tmp/px4_sim.log 2>&1 &
 PX4_PID=$!
-sleep 10
-require_alive "$PX4_PID" "PX4 SITL + Gazebo" /tmp/px4_sim.log
+wait_for_ready "PX4 SITL (MAVLink 14540)" "$PX4_PID" /tmp/px4_sim.log 30 "grep -q 'Ready for takeoff!' /tmp/px4_sim.log || grep -q 'mavlink start' /tmp/px4_sim.log || ss -ulpn 2>/dev/null | grep -q 14540"
 MAVLINK_FORWARDING_OK=0
 if configure_windows_mavlink; then
   MAVLINK_FORWARDING_OK=1
@@ -197,16 +224,14 @@ echo "[2/5] Khởi động ROS 2 parameter bridge..."
 ros2 run ros_gz_bridge parameter_bridge \
   "/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image" > /tmp/ros_bridge.log 2>&1 &
 BRIDGE_PID=$!
-sleep 2
-require_alive "$BRIDGE_PID" "ROS-Gazebo bridge" /tmp/ros_bridge.log
+wait_for_ready "ROS-Gazebo bridge (/camera/image_raw)" "$BRIDGE_PID" /tmp/ros_bridge.log 15 "ros2 topic list 2>/dev/null | grep -q '/camera/image_raw'"
 
 if [[ "${SIM_REALISM:-0}" == "1" ]]; then
   echo "[2b/5] Bật sensor/camera realism profile..."
   ros2 run vision_tracking sim_realism_node --ros-args \
     --params-file "${PROJECT_DIR}/simulation/realism.yaml" > /tmp/sim_realism.log 2>&1 &
   REALISM_PID=$!
-  sleep 1
-  require_alive "$REALISM_PID" "Simulation realism" /tmp/sim_realism.log
+  wait_for_ready "Simulation Realism" "$REALISM_PID" /tmp/sim_realism.log 10 "ros2 topic list 2>/dev/null | grep -q '/simulation/camera/image'"
   YOLO_IMAGE_TOPIC="${YOLO_IMAGE_TOPIC:-/simulation/camera/image}"
 else
   YOLO_IMAGE_TOPIC="${YOLO_IMAGE_TOPIC:-/camera/image_raw}"
@@ -246,19 +271,18 @@ fi
   -p max_frame_rate:=${YOLO_MAX_FPS:-0.0} \
   -p show_debug_image:=${YOLO_DEBUG:-False} -p conf:=${YOLO_CONF:-0.45} > /tmp/yolo.log 2>&1 &
 YOLO_PID=$!
-sleep 2
-require_alive "$YOLO_PID" "YOLO detector" /tmp/yolo.log
+wait_for_ready "YOLO detector (/tracking/error)" "$YOLO_PID" /tmp/yolo.log 25 "ros2 topic list 2>/dev/null | grep -q '/tracking/error'"
 
-echo "[5/5] Khởi động MotionArbiter (PX4 OFFBOARD State Machine)..."
+echo "[4/5] Khởi động MotionArbiter (PX4 OFFBOARD State Machine & Watchdog)..."
 TAKEOFF_ALT="${TAKEOFF_ALT:-3.8}"
 printf -v TAKEOFF_ALT_ROS '%.6f' "${TAKEOFF_ALT}"
 echo "Auto takeoff altitude: ${TAKEOFF_ALT_ROS} m"
 "${COMPANION_RUN[@]}" python3 "${PROJECT_DIR}/motion_arbiter.py" \
   --ros-args -p takeoff_alt:=${TAKEOFF_ALT_ROS} -p auto_takeoff:=True -p mavlink:=udpin:0.0.0.0:14540 > /tmp/motion_arbiter.log 2>&1 &
 ARBITER_PID=$!
-sleep 2
-require_alive "$ARBITER_PID" "MotionArbiter" /tmp/motion_arbiter.log
+wait_for_ready "MotionArbiter (/tracking/control_health)" "$ARBITER_PID" /tmp/motion_arbiter.log 25 "ros2 topic list 2>/dev/null | grep -q '/tracking/control_health'"
 
+echo "[5/5] Cấu hình QGroundControl & HUD..."
 launch_qgroundcontrol
 
 if [[ "${SHOW_HUD:-1}" == "1" ]]; then
@@ -272,10 +296,16 @@ fi
 
 echo "======================================================="
 echo "   PX4 AUTOPILOT + GAZEBO HARMONIC SẴN SÀNG!            "
+echo "======================================================="
+echo "   - Gazebo Harmonic      [PID: ${GZ_PID}]  READY (world: ${WORLD_NAME})"
+echo "   - PX4 SITL Autopilot   [PID: ${PX4_PID}] READY (MAVLink 14540)"
+echo "   - ROS-GZ Bridge        [PID: ${BRIDGE_PID}] READY (/camera/image_raw)"
+echo "   - YOLO Detector Node   [PID: ${YOLO_PID}] READY (/tracking/error)"
+echo "   - MotionArbiter (10Hz) [PID: ${ARBITER_PID}] READY (/tracking/control_health)"
 if [[ -n "${QGC_PID:-}" ]] && kill -0 "${QGC_PID}" 2>/dev/null; then
-  echo "   QGroundControl đang chạy và tự động kết nối UDP 14550"
+  echo "   - QGroundControl       [PID: ${QGC_PID}] CONNECTED (UDP 14550)"
 else
-  echo "   QGroundControl chưa chạy (xem cảnh báo ở trên)"
+  echo "   - QGroundControl       CHƯA CHẠY (xem cảnh báo ở trên)"
 fi
 echo "======================================================="
 echo "Nhấn Ctrl-C để dừng toàn bộ stack."

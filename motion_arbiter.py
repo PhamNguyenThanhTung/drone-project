@@ -20,6 +20,8 @@ Features:
 
 import time
 import math
+import json
+import os
 import threading
 from typing import Optional, Tuple
 
@@ -95,6 +97,20 @@ class MotionArbiter(Node):
         self.declare_parameter('target_area_min', 6000.0)
         self.declare_parameter('target_area_max', 13000.0)
         self.declare_parameter('kp_area', 0.00015)
+        self.declare_parameter('control_period_s', 0.10)
+        self.declare_parameter('control_warn_period_s', 0.20)
+        self.declare_parameter('control_fail_period_s', 0.50)
+        self.declare_parameter('health_publish_period_s', 0.50)
+        self.declare_parameter('mavlink_stale_timeout_s', 2.0)
+        self.declare_parameter('kp_z', 1.20)
+        self.declare_parameter('max_z_speed', 0.80)
+        self.declare_parameter(
+            'diagnostic_log',
+            os.environ.get(
+                'TRACKING_DIAG_LOG',
+                os.path.join(os.path.dirname(__file__), 'logs', 'tracking_diagnostics.jsonl'),
+            ),
+        )
 
         gp = self.get_parameter
         self.mavlink_uri = gp('mavlink').value
@@ -124,6 +140,13 @@ class MotionArbiter(Node):
         self.target_area_min = float(gp('target_area_min').value)
         self.target_area_max = float(gp('target_area_max').value)
         self.kp_area = float(gp('kp_area').value)
+        self.control_period_s = max(0.02, float(gp('control_period_s').value))
+        self.control_warn_period_s = max(self.control_period_s, float(gp('control_warn_period_s').value))
+        self.control_fail_period_s = max(self.control_warn_period_s, float(gp('control_fail_period_s').value))
+        self.health_publish_period_s = max(0.10, float(gp('health_publish_period_s').value))
+        self.mavlink_stale_timeout_s = max(0.5, float(gp('mavlink_stale_timeout_s').value))
+        self.kp_z = max(0.1, float(gp('kp_z').value))
+        self.max_z_speed = max(0.2, float(gp('max_z_speed').value))
         self._distance_mode = 'neutral'
 
         # State Machine (Default: STANDBY - waits for user click/key before tracking)
@@ -160,6 +183,7 @@ class MotionArbiter(Node):
         self.last_tracking_substate: Optional[str] = None
         self._last_vx: float = 0.0
         self._last_vy: float = 0.0
+        self._last_vz: float = 0.0
         self._last_yaw_rate: float = 0.0
         self.goto_lat: Optional[float] = None
         self.goto_lon: Optional[float] = None
@@ -175,11 +199,10 @@ class MotionArbiter(Node):
         self.last_teleop_cmd_time: float = 0.0
 
         # Real-time diagnostic logger
-        self.diag_log_file = '/home/tungt/drone-project/logs/tracking_diagnostics.jsonl'
+        self.diag_log_file = str(gp('diagnostic_log').value)
         self.diag_file_handle = None
         try:
-            import os
-            os.makedirs('/home/tungt/drone-project/logs', exist_ok=True)
+            os.makedirs(os.path.dirname(self.diag_log_file) or '.', exist_ok=True)
             self.diag_file_handle = open(self.diag_log_file, 'a', buffering=1)
         except Exception as exc:
             self.get_logger().warning(f"Could not open diagnostic log file: {exc}")
@@ -201,6 +224,13 @@ class MotionArbiter(Node):
 
         # Timing & locks
         self.last_tick_time = time.time()
+        self.last_tick_monotonic = time.monotonic()
+        self.last_setpoint_monotonic = 0.0
+        self.last_health_publish_monotonic = 0.0
+        self.max_control_period_s = 0.0
+        self.control_tick_count = 0
+        self.watchdog_stall_count = 0
+        self._watchdog_stall_active = False
         self.lock = threading.Lock()
 
         # ROS 2 Subscriptions & Publishers
@@ -211,6 +241,7 @@ class MotionArbiter(Node):
         self.create_subscription(Point, '/tracking/goto_gps', self.on_goto_gps, 10)
         self.pub_state = self.create_publisher(String, '/tracking/motion_state', 10)
         self.pub_gps = self.create_publisher(NavSatFix, '/tracking/gps', 10)
+        self.pub_health = self.create_publisher(String, '/tracking/control_health', 10)
 
         # Establish single MAVLink connection to PX4
         self.master = None
@@ -220,10 +251,14 @@ class MotionArbiter(Node):
         if self.auto_takeoff:
             threading.Thread(target=self._auto_takeoff_worker, daemon=True).start()
 
-        # 10 Hz Control Dispatch Loop
-        self.timer = self.create_timer(0.10, self.tick)
+        # 10 Hz Control Dispatch Loop. A separate monitor detects a callback
+        # stall even while the ROS executor is blocked and records it for the
+        # regression safety metrics.
+        self.timer = self.create_timer(self.control_period_s, self.tick)
+        threading.Thread(target=self._control_watchdog_loop, daemon=True, name='control-watchdog').start()
         self.get_logger().info(
-            f'MotionArbiter ready: auto_takeoff={self.auto_takeoff}, takeoff_alt={self.takeoff_alt:.1f}m'
+            f'MotionArbiter ready: auto_takeoff={self.auto_takeoff}, '
+            f'takeoff_alt={self.takeoff_alt:.1f}m, control_period={self.control_period_s:.3f}s'
         )
 
     # ------------------------------------------------------------------
@@ -282,14 +317,15 @@ class MotionArbiter(Node):
             if msg is None:
                 continue
             mtype = msg.get_type()
+            # Only track HEARTBEAT from the vehicle autopilot
+            if mtype == 'HEARTBEAT' and (msg.get_srcSystem() != m.target_system or getattr(msg, 'type', 0) == mavutil.mavlink.MAV_TYPE_GCS):
+                continue
             with self.rx_lock:
                 self.rx_latest[mtype] = (time.time(), msg)
             if mtype == 'HEARTBEAT':
-                # Only update vehicle armed status from the autopilot heartbeat, NOT from GCS or companion components
-                if msg.get_srcSystem() == m.target_system and getattr(msg, 'type', 0) != mavutil.mavlink.MAV_TYPE_GCS:
-                    self.vehicle_armed = bool(
-                        int(msg.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                    )
+                self.vehicle_armed = bool(
+                    int(msg.base_mode) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
             elif mtype == 'ATTITUDE':
                 self.current_yaw = float(getattr(msg, 'yaw', 0.0))
                 self.current_pitch = float(getattr(msg, 'pitch', 0.0))
@@ -314,6 +350,49 @@ class MotionArbiter(Node):
         if max_age is not None and (time.time() - ts) > max_age:
             return None
         return msg
+
+    def _rx_age(self, mtype):
+        with self.rx_lock:
+            entry = self.rx_latest.get(mtype)
+        return (time.time() - entry[0]) if entry is not None else float('inf')
+
+    def get_current_altitude(self) -> float:
+        """Return the best available real-time altitude above takeoff ground level.
+
+        Prefers high-rate EKF2 local NED z (-z is height above ground) when available,
+        falling back to GLOBAL_POSITION_INT relative_alt or takeoff_alt.
+        """
+        local_z = getattr(self, 'current_local_z', None)
+        if local_z is not None and abs(local_z) > 0.05:
+            return -float(local_z)
+        cur_alt = getattr(self, 'current_alt', None)
+        if cur_alt is not None and cur_alt > 0.1:
+            return float(cur_alt)
+        return float(getattr(self, 'takeoff_alt', 3.8))
+
+    def _is_offboard(self):
+        heartbeat = self._rx_get('HEARTBEAT', max_age=self.mavlink_stale_timeout_s)
+        if heartbeat is None:
+            return False
+        return (
+            bool(int(getattr(heartbeat, 'base_mode', 0)) & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED)
+            and ((int(getattr(heartbeat, 'custom_mode', 0)) >> 16) & 0xFF)
+            == PX4_CUSTOM_MAIN_MODE_OFFBOARD
+        )
+
+    def _control_watchdog_loop(self):
+        while True:
+            time.sleep(min(0.10, self.control_period_s))
+            age = time.monotonic() - self.last_tick_monotonic
+            if age > self.control_fail_period_s and not self._watchdog_stall_active:
+                self._watchdog_stall_active = True
+                self.watchdog_stall_count += 1
+                self.get_logger().error(
+                    f'[WATCHDOG] Control callback stalled {age:.2f}s '
+                    f'(limit {self.control_fail_period_s:.2f}s); PX4 failsafe must handle the gap.'
+                )
+            elif age <= self.control_warn_period_s:
+                self._watchdog_stall_active = False
 
     def _apply_sitl_failsafe_tolerances(self):
         """Relax the OFFBOARD-loss timeout for SITL running on a loaded host.
@@ -448,7 +527,7 @@ class MotionArbiter(Node):
         return False
 
     def _send_offboard_velocity(self, vx: float, vy: float, vz: float, yaw_rate: float = 0.0):
-        """Send setpoint to PX4 OFFBOARD mode using LOCAL_NED with active Z altitude hold."""
+        """Send setpoint to PX4 OFFBOARD mode using LOCAL_NED with active Z altitude hold & vertical velocity."""
         m = self.master
         if m is None:
             return
@@ -458,18 +537,22 @@ class MotionArbiter(Node):
         sin_y = math.sin(yaw)
         vx_ned = vx * cos_y - vy * sin_y
         vy_ned = vx * sin_y + vy * cos_y
+        vz_ned = -vz  # Convert FLU vertical speed (+UP) to NED vertical speed (+DOWN)
 
         ground_z = getattr(self, 'ground_z', 0.0)
         target_z = getattr(self, 'target_z_ned', ground_z - self.takeoff_alt)
 
-        # 0x05E3: Position Z active (PX4 EKF2 P-position loop maintains altitude),
-        # Velocity X/Y active in NED frame, Yaw Rate active with direct angular velocity authority.
+        # 0x05C3: Position Z active (PX4 maintains altitude baseline target_z),
+        # Velocity X/Y active in NED frame, Velocity Z active (vz_ned feedforward/feedback),
+        # Yaw Rate active with direct angular velocity authority.
+        # Ignored bits: 0x0001 (pos_x), 0x0002 (pos_y), 0x0040 (ax), 0x0080 (ay), 0x0100 (az), 0x0400 (yaw).
+        # Sum = 0x0001 + 0x0002 + 0x0040 + 0x0080 + 0x0100 + 0x0400 = 0x05C3
         m.mav.set_position_target_local_ned_send(
             0, m.target_system, m.target_component,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0x05E3,
+            0x05C3,
             0.0, 0.0, float(target_z),
-            float(vx_ned), float(vy_ned), 0.0,
+            float(vx_ned), float(vy_ned), float(vz_ned),
             0.0, 0.0, 0.0,
             0.0, float(yaw_rate)
         )
@@ -639,6 +722,11 @@ class MotionArbiter(Node):
         old_state = self.current_state
         self.current_state = new_state
         self.active_target_id = target_id
+        if new_state != STATE_TRACKING:
+            self._last_vx = 0.0
+            self._last_vy = 0.0
+            self._last_vz = 0.0
+            self._last_yaw_rate = 0.0
 
         log_str = (
             f"\nSTATE CHANGE\n"
@@ -736,12 +824,14 @@ class MotionArbiter(Node):
                 self.direction = 1.0 if self.error_x > 0.0 else -1.0
                 self.target_turn_dir = 1.0 if self.error_x > 0.0 else -1.0
 
-            # 3D Pinhole & Tree Clearance Geometry
-            current_h = self.current_alt if (self.current_alt is not None and self.current_alt > 0.5) else self.takeoff_alt
-            h_rel = max(1.2, current_h - 0.90)
+            # 3D Pinhole & Tree Clearance Geometry (real-time altitude & pitch compensation)
+            current_h = self.get_current_altitude()
+            h_rel = max(0.5, current_h - 0.90)
             alpha_y = math.atan2(self.error_y, 178.07)
             alpha_x = math.atan2(self.error_x, 133.55)
-            theta_dep = max(0.15, min(1.45, 0.65 + alpha_y))
+            # Camera is physically angled ~0.65 rad down. Pitch > 0 tilts nose up (reducing depression angle).
+            pitch_rad = getattr(self, 'current_pitch', 0.0)
+            theta_dep = max(0.15, min(1.45, 0.65 - pitch_rad + alpha_y))
 
             dx = h_rel / math.tan(theta_dep)
             dy = dx * math.tan(alpha_x)
@@ -758,16 +848,27 @@ class MotionArbiter(Node):
     # ------------------------------------------------------------------
     def tick(self):
         now = time.time()
-        raw_dt = now - self.last_tick_time
+        monotonic_now = time.monotonic()
+        last_mono = getattr(self, 'last_tick_monotonic', monotonic_now - 0.10)
+        raw_dt = monotonic_now - last_mono
         dt = max(0.01, min(0.20, raw_dt))
         self.last_tick_time = now
-        if raw_dt >= 0.50:
+        self.last_tick_monotonic = monotonic_now
+        self.control_tick_count = getattr(self, 'control_tick_count', 0) + 1
+        self.max_control_period_s = max(getattr(self, 'max_control_period_s', 0.0), raw_dt)
+        control_warn = getattr(self, 'control_warn_period_s', 0.20)
+        control_target = getattr(self, 'control_period_s', 0.10)
+        if raw_dt >= control_warn:
             # The field incident behind this node's COM_OF_LOSS_T tolerance:
             # make visible whatever stalls the loop so it can be attributed.
-            self.get_logger().warning(
-                f'[WATCHDOG] Control loop stalled {raw_dt:.2f}s (target 0.10s); '
-                'OFFBOARD stream gaps trigger the PX4 offboard-loss failsafe'
-            )
+            logger = self.get_logger()
+            log_warn = getattr(logger, 'warning', getattr(logger, 'warn', None))
+            if log_warn is not None:
+                log_warn(
+                    f'[WATCHDOG] Control loop late {raw_dt:.2f}s '
+                    f'(target {control_target:.2f}s); '
+                    'OFFBOARD stream gaps trigger the PX4 offboard-loss failsafe'
+                )
         self._update_gps_telemetry()
 
         final_vx = 0.0
@@ -808,9 +909,9 @@ class MotionArbiter(Node):
                     final_vy = self.teleop_vy
                     final_vz = self.teleop_vz
                     final_yaw_rate = self.teleop_yaw_rate
-                    # Update target_z_ned during vertical teleop
+                    # Update target_z_ned during vertical teleop (in NED, up is -z)
                     if abs(self.teleop_vz) > 0.05:
-                        self.target_z_ned += self.teleop_vz * dt
+                        self.target_z_ned -= self.teleop_vz * dt
                 else:
                     final_vx, final_vy, final_vz, final_yaw_rate = 0.0, 0.0, 0.0, 0.0
 
@@ -825,7 +926,16 @@ class MotionArbiter(Node):
                 goto_reached = self._goto_reached()
 
             elif state == STATE_STANDBY:
-                final_vx, final_vy, final_vz, final_yaw_rate = 0.0, 0.0, 0.0, 0.0
+                final_vx = 0.0
+                final_vy = 0.0
+                final_yaw_rate = 0.0
+                if self.is_airborne:
+                    alt_err = self.takeoff_alt - self.get_current_altitude()
+                    kp_z = getattr(self, 'kp_z', 1.20)
+                    max_z = getattr(self, 'max_z_speed', 0.80)
+                    final_vz = max(-max_z, min(max_z, kp_z * alt_err))
+                else:
+                    final_vz = 0.0
 
         # Dispatch single MAVLink velocity setpoint to PX4 OFFBOARD
         m = self.master
@@ -834,6 +944,7 @@ class MotionArbiter(Node):
                 self._send_goto_position_setpoint()
             else:
                 self._send_offboard_velocity(final_vx, final_vy, final_vz, final_yaw_rate)
+            self.last_setpoint_monotonic = monotonic_now
 
         if dispatch_goto and goto_reached:
             self.set_state(
@@ -845,16 +956,31 @@ class MotionArbiter(Node):
         # Real-time diagnostic logging
         if self.diag_file_handle is not None and not self.diag_file_handle.closed:
             try:
-                import json
                 current_alt = self.current_alt if self.current_alt is not None else 0.0
                 target_alt = self.takeoff_alt
                 alt_error = current_alt - target_alt
 
                 events = []
+                heartbeat_age = self._rx_age('HEARTBEAT') if hasattr(self, '_rx_age') else float('inf')
+                position_age = self._rx_age('LOCAL_POSITION_NED') if hasattr(self, '_rx_age') else float('inf')
+                offboard_active = self._is_offboard() if hasattr(self, '_is_offboard') else False
+                stale_timeout = getattr(self, 'mavlink_stale_timeout_s', 2.0)
+                warn_period = getattr(self, 'control_warn_period_s', 0.20)
+                fail_period = getattr(self, 'control_fail_period_s', 0.50)
                 if self.is_airborne and abs(alt_error) > 0.35:
                     events.append('ALTITUDE_DROP')
                 if state == STATE_TRACKING and age > 1.2:
                     events.append('TARGET_LOST')
+                if raw_dt >= warn_period:
+                    events.append('CONTROL_LOOP_LATE')
+                if raw_dt >= fail_period:
+                    events.append('CONTROL_LOOP_STALL')
+                if heartbeat_age > stale_timeout:
+                    events.append('MAVLINK_HEARTBEAT_STALE')
+                if self.is_airborne and position_age > stale_timeout:
+                    events.append('LOCAL_POSITION_STALE')
+                if self.is_airborne and getattr(self, 'vehicle_armed', None) and not offboard_active:
+                    events.append('OFFBOARD_MODE_LOST')
 
                 if abs(final_yaw_rate) > 0.08:
                     sign = 1 if final_yaw_rate > 0 else -1
@@ -864,6 +990,7 @@ class MotionArbiter(Node):
                 if len(self._yaw_sign_history) >= 4:
                     events.append('YAW_OSCILLATION')
 
+                last_sp = getattr(self, 'last_setpoint_monotonic', None)
                 entry = {
                     'timestamp': round(now, 3),
                     'state': state,
@@ -880,11 +1007,43 @@ class MotionArbiter(Node):
                     'cmd_vz': round(final_vz, 3),
                     'cmd_yaw_rate': round(final_yaw_rate, 3),
                     'yaw_deg': round(getattr(self, 'current_yaw', 0.0) * 57.2958, 1),
+                    'control_period_s': round(raw_dt, 4),
+                    'max_control_period_s': round(getattr(self, 'max_control_period_s', 0.0), 4),
+                    'control_tick_count': getattr(self, 'control_tick_count', 0),
+                    'watchdog_stall_count': getattr(self, 'watchdog_stall_count', 0),
+                    'mavlink_heartbeat_age_s': round(heartbeat_age, 3) if math.isfinite(heartbeat_age) else None,
+                    'local_position_age_s': round(position_age, 3) if math.isfinite(position_age) else None,
+                    'vehicle_armed': getattr(self, 'vehicle_armed', None),
+                    'offboard_active': offboard_active,
+                    'setpoint_age_s': round(monotonic_now - last_sp, 3) if last_sp is not None else None,
                     'events': events
                 }
                 self.diag_file_handle.write(json.dumps(entry) + '\n')
             except Exception:
                 pass
+
+        pub_health = getattr(self, 'pub_health', None)
+        health_period = getattr(self, 'health_publish_period_s', 0.50)
+        last_health_mono = getattr(self, 'last_health_publish_monotonic', 0.0)
+        if pub_health is not None and (monotonic_now - last_health_mono >= health_period):
+            self.last_health_publish_monotonic = monotonic_now
+            hb_age = self._rx_age('HEARTBEAT') if hasattr(self, '_rx_age') else float('inf')
+            pos_age = self._rx_age('LOCAL_POSITION_NED') if hasattr(self, '_rx_age') else float('inf')
+            stale_to = getattr(self, 'mavlink_stale_timeout_s', 2.0)
+            health = {
+                'status': 'READY' if self.master is not None and hb_age <= stale_to else 'DEGRADED',
+                'control_period_s': round(raw_dt, 4),
+                'max_control_period_s': round(getattr(self, 'max_control_period_s', 0.0), 4),
+                'heartbeat_age_s': round(hb_age, 3) if math.isfinite(hb_age) else None,
+                'position_age_s': round(pos_age, 3) if math.isfinite(pos_age) else None,
+                'vehicle_armed': getattr(self, 'vehicle_armed', None),
+                'offboard_active': self._is_offboard() if hasattr(self, '_is_offboard') else False,
+                'watchdog_stall_count': getattr(self, 'watchdog_stall_count', 0),
+                'state': self.current_state,
+            }
+            msg = String()
+            msg.data = json.dumps(health, separators=(',', ':'))
+            pub_health.publish(msg)
 
     def _update_gps_telemetry(self):
         """Publish the latest PX4 global position for the HUD minimap."""
@@ -946,7 +1105,12 @@ class MotionArbiter(Node):
 
         vx = 0.0
         vy = 0.0
-        vz = 0.0
+        # Closed-loop vertical velocity control: maintain target altitude
+        current_h = self.get_current_altitude()
+        alt_error = self.takeoff_alt - current_h
+        kp_z = getattr(self, 'kp_z', 1.20)
+        max_z = getattr(self, 'max_z_speed', 0.80)
+        vz = max(-max_z, min(max_z, kp_z * alt_error))
         yaw_rate = 0.0
         substate = 'TRACKING'
 
@@ -1001,16 +1165,16 @@ class MotionArbiter(Node):
                 if self.enable_forward:
                     if is_approaching:
                         # SCENARIO A: Target is walking towards drone / getting close -> BACK UP
-                        # Crucial: Keep looking forward at approaching target while reversing. DO NOT spin 180°!
+                        # Smooth proportional reverse without abrupt step jump to prevent pitch jerk
                         if error_y > self.deadband_y:
                             boost = self.kp_y_boost * (error_y - self.deadband_y)
                         else:
                             boost = self.kp_area * (self.area - self.target_area_max)
-                        vx = -(self.default_backup_speed + boost)
+                        vx = -min(self.default_backup_speed + 0.25, 0.15 + boost)
                         substate = 'BACKING_SMOOTH'
-                        # Smooth yaw while backing to keep camera centered without spinning away
-                        yaw_rate = max(-0.40, min(0.40, yaw_rate))
-                        vy = max(-0.25, min(0.25, vy))
+                        # Retain responsive yaw and lateral tracking so camera stays locked on target
+                        yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
+                        vy = max(-0.35, min(0.35, vy))
 
                     elif error_y < -self.deadband_y:
                         # SCENARIO B: Target is moving forward / high in frame -> ADVANCE
@@ -1056,20 +1220,18 @@ class MotionArbiter(Node):
 
         elif not acquired_once:
             substate = 'WAITING_FOR_TARGET'
-            vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
+            vx, vy, yaw_rate = 0.0, 0.0, 0.0
         else:
             # Target was lost from view:
             # If target exited via the bottom of the frame (walked past underneath),
-            # reverse far enough to widen the forward camera view before yawing.
+            # smoothly reverse with decayed lateral velocity and gentle yaw heading recovery
+            # rather than locking controls to zero or backing up blindly.
             if self.last_seen_y > self.deadband_y and age <= self.bottom_backup_timeout:
                 substate = 'BACKING_UP_TO_RECOVER'
-                # The target was at the lower edge immediately before the
-                # miss.  Reverse a short, capped distance with the camera
-                # still facing forward, then begin yaw recovery if needed.
-                vx = -min(0.55, self.default_backup_speed)
-                vy = 0.0
-                vz = 0.0
-                yaw_rate = 0.0
+                taper = max(0.20, 1.0 - (age / self.bottom_backup_timeout))
+                vx = -min(0.45, self.default_backup_speed) * taper
+                vy = self._last_vy * 0.85
+                yaw_rate = self.target_turn_dir * min(self.search_rate, 0.50) * (1.0 - 0.3 * taper)
             elif (self.last_seen_y <= self.deadband_y
                   and self.dist_advanced < target_dist
                   and age <= self.turn_point_timeout):
@@ -1082,55 +1244,58 @@ class MotionArbiter(Node):
                     vx = speed * (target_dx / target_dist)
                     vy = speed * (target_dy / target_dist)
                 self.dist_advanced += speed * dt
-                vz = 0.0
                 yaw_rate = 0.0
             elif age <= self.lost_timeout:
                 # Target turned off-screen laterally: rotate towards turn direction to scan
                 substate = 'RECOVERING_YAW_HEADING'
                 vx = 0.0
                 vy = 0.0
-                vz = 0.0
                 yaw_rate = self.target_turn_dir * self.search_rate
             else:
                 substate = 'SEARCHING_HOLD'
                 vx = 0.0
                 vy = 0.0
-                vz = 0.0
                 yaw_rate = 0.0
 
         yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
 
         # Slew rate limiters: gentle acceleration on XY to prevent pitch-induced altitude bobbing,
         # smooth yaw acceleration to prevent sudden jerking
-        # Brake faster after a vision timeout, while retaining slew limiting
-        # during normal tracking so camera noise cannot create jerks.
-        accel_x = 1.6
-        brake_x = 6.0 if not vision_fresh else 4.0
+        accel_x = 1.5
+        brake_x = 2.4
         reducing_x = (
             abs(vx) < abs(self._last_vx)
             or (vx * self._last_vx < 0.0)
         )
         max_delta_x = (brake_x if reducing_x else accel_x) * dt
         vx = max(self._last_vx - max_delta_x, min(self._last_vx + max_delta_x, vx))
-        accel_y = 1.6
-        brake_y = 6.0 if not vision_fresh else 4.0
+
+        accel_y = 1.5
+        brake_y = 2.4
         reducing_y = (
             abs(vy) < abs(self._last_vy)
             or (vy * self._last_vy < 0.0)
         )
         max_delta_y = (brake_y if reducing_y else accel_y) * dt
         vy = max(self._last_vy - max_delta_y, min(self._last_vy + max_delta_y, vy))
-        max_yaw_accel = 5.0 * dt
+
+        # Vertical slew rate limiter to prevent violent heave shocks
+        accel_z = 1.5
+        max_delta_z = accel_z * dt
+        vz = max(self._last_vz - max_delta_z, min(self._last_vz + max_delta_z, vz))
+
+        max_yaw_accel = 3.5 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
 
         if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):
             self.get_logger().info(
-                f"[TRACKING substate: {substate}] vx={vx:.2f} m/s, vy={vy:.2f} m/s, yaw_rate={yaw_rate*57.3:+.1f} deg/s"
+                f"[TRACKING substate: {substate}] vx={vx:.2f} m/s, vy={vy:.2f} m/s, vz={vz:.2f} m/s, yaw_rate={yaw_rate*57.3:+.1f} deg/s"
             )
             self.last_tracking_substate = substate
 
         self._last_vx = vx
         self._last_vy = vy
+        self._last_vz = vz
         self._last_yaw_rate = yaw_rate
 
         return vx, vy, vz, yaw_rate

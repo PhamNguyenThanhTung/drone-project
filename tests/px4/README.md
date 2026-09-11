@@ -15,10 +15,20 @@ generated message packages such as `geometry_msgs`.
 The scripts cover baseline MAVLink/MAVSDK flights, offboard climb and axis
 checks, live-message verification, the motion-arbiter state machine, and the
 camera-driven approach check (`test_approach_camera.py`, uses the
-`person_tracking_approach` world whose actor paces 3–8 m ahead of the drone).
+`person_tracking_approach` world whose actor paces 3–8 m ahead of the drone),
+as well as the 5-scenario isolated regression runner (`run_isolated_multi_trial.py`).
 
-These are live SITL tests. They may start PX4/Gazebo processes and require the
-PX4-Autopilot checkout at `/home/tungt/PX4-Autopilot`.
+These are live SITL tests. They may start PX4/Gazebo processes and resolve the
+PX4-Autopilot directory automatically or via the `PX4_DIR` environment variable
+(default: `../PX4-Autopilot` or `/home/tungt/PX4-Autopilot`).
+
+```bash
+# Chạy multi-trial regression đầy đủ (SITL):
+python3 tests/px4/run_isolated_multi_trial.py
+
+# Hoặc phân tích offline các file raw CSV hiện có:
+python3 tests/px4/run_isolated_multi_trial.py --analyze-only
+```
 
 ## Gotchas
 

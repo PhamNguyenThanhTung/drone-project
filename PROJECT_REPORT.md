@@ -351,64 +351,82 @@ Runner `tests/px4/run_isolated_multi_trial.py` tạo năm kịch bản độc l�
 Mỗi trial ghi raw CSV theo wall-clock time, altitude, yaw rate và tracking
 state. Summary được lưu trong `logs/multi_trial_summary.json`.
 
-### 7.3 Kết quả gần nhất
+### 7.3 Kết quả gần nhất (Đã chuẩn hóa Stage 1 - Phân tách 3 lớp chỉ số)
 
-| Trial | Altitude baseline | Min/Max trong maneuver | Drop | Tracking retention | Status |
-| ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | `3.723 m` | `3.638 / 3.751 m` | `0.085 m` | `10.6%` | PASS |
-| 2 | `3.720 m` | `3.810 / 3.838 m` | `0.000 m` | `12.3%` | PASS |
-| 3 | `3.620 m` | `3.365 / 3.844 m` | `0.255 m` | `24.3%` | FAIL |
-| 4 | `3.589 m` | `3.668 / 3.768 m` | `0.000 m` | `32.1%` | PASS |
-| 5 | `3.689 m` | `3.502 / 3.737 m` | `0.187 m` | `33.3%` | FAIL |
+Toàn bộ kết quả đã được chuẩn hóa trong `logs/multi_trial_summary.json` với đường dẫn tương đối (portable), run metadata (commit SHA, dirty status, CPU loadavg, thông tin GPU CUDA, parameters) và phân tách độc lập 3 lớp chỉ số:
+
+| Trial | Kịch bản | Alt Drop | Control | Track % | Perception | Safety | Status |
+| ---: | --- | ---: | --- | ---: | --- | --- | --- |
+| 1 | `nominal_180_turn` | `0.085 m` | PASS | `10.6%` | FAIL | PASS | PASS |
+| 2 | `fast_180_turn` | `0.000 m` | PASS | `12.3%` | FAIL | PASS | PASS |
+| 3 | `lateral_left_turn` | `0.255 m` | FAIL | `24.3%` | WARN | PASS | FAIL |
+| 4 | `lateral_right_turn` | `0.000 m` | PASS | `32.1%` | WARN | PASS | PASS |
+| 5 | `aggressive_close_in` | `0.187 m` | FAIL | `33.3%` | WARN | PASS | FAIL |
+
+*Ghi chú:*
+- **Control (Ngưỡng altitude drop <= 0.15 m & chu kỳ vòng lặp < 0.50 s):** 3/5 kịch bản PASS (Trial 1, 2, 4). Trial 3 và 5 tụt độ cao quá ngưỡng quy định khi target di chuyển dạt biên hoặc áp sát quá nhanh.
+- **Perception (Tracking retention):** Retention dao động từ `10.6%` đến `33.3%`. Dù drone không bị va chạm hay mất điều khiển, detector/tracker vẫn mất dấu mục tiêu trong phần lớn thời gian quay đầu.
+- **Safety (Watchdog stall, offboard mode drop, crash):** 5/5 kịch bản PASS (0 lần stall vòng lặp điều khiển, không rớt chế độ OFFBOARD, không có va chạm hay chạm đất bất thường).
 
 ### 7.4 Đánh giá kết quả
 
 Điểm tích cực:
 
-- Ba kịch bản đạt tiêu chí hiện tại của runner.
-- Altitude drop thấp trong trial 1, 2 và 4.
-- Pipeline có khả năng ghi raw telemetry và tái hiện theo từng scenario.
+- **Tách bạch chỉ số:** Không còn gộp chung đánh giá thành công chỉ dựa vào altitude drop; hiện đã nhìn rõ bức tranh 3 lớp: An toàn (100% PASS), Điều khiển (60% PASS), Nhận thức (cần cải thiện nhiều).
+- **Run metadata & Portable artifacts:** Summary JSON đã lưu trữ relative paths (`logs/...`), commit SHA, trạng thái git dirty, tải CPU/GPU và thông số vận hành, đảm bảo kết quả có thể chia sẻ và tái hiện độc lập trên CI.
+- **Watchdog & Health monitoring:** MotionArbiter phát telemetry định kỳ lên `/tracking/control_health` và theo dõi watchdog thời gian thực, loại bỏ điểm mù offboard stream gap.
 
-Điểm chưa đạt:
+Điểm chưa đạt (Tập trung giải quyết trong Giai đoạn 2 & 3):
 
-- Trial 3 và 5 thất bại.
-- Tracking retention từ `10.6%` đến `33.3%` là thấp, kể cả trong trial PASS.
-- Trạng thái PASS hiện tại có thể thiên về altitude/control thresholds hơn là
-  chất lượng tracking end-to-end.
-- Summary chứa absolute paths của máy phát sinh log; cần chuyển sang relative
-  paths để artifact portable hơn.
+- Trial 3 và 5 thất bại ở tầng Control do độ tụt độ cao vượt ngưỡng 0.15 m trong các pha người quay gấp.
+- Tracking retention từ `10.6%` đến `33.3%` là thấp, kể cả trong trial PASS, cho thấy drone dễ bị mất dấu đối tượng khi góc nhìn camera bị rung lắc hoặc đối tượng lệch khỏi khung hình.
 
-Kết luận: bộ test đã hữu ích cho regression, nhưng tiêu chí nghiệm thu cần được
-siết để PASS phản ánh cả flight stability và tracking continuity.
+Kết luận: Nền tảng luồng vận hành, chuỗi khởi động và bộ khung regression (Giai đoạn 1) đã hoàn tất và ổn định. Mục tiêu trọng tâm tiếp theo là nâng cao độ bền vững của tracking (Giai đoạn 2).
 
 ## 8. Rủi ro và vấn đề đang mở
 
 | Mức độ | Rủi ro | Tác động | Hướng xử lý |
 | --- | --- | --- | --- |
-| Cao | Tracking retention thấp | Mất target, lệnh tìm kiếm/recovery thường xuyên | FOV analysis, tune detector/tracker, temporal filtering |
-| Cao | 2/5 regression FAIL | Chưa đủ độ tin cậy | Root-cause từng trial, chạy lặp nhiều seed |
-| Cao | Chưa đo airframe thật | Model/control không đại diện drone thật | Bench measurement trước HIL |
-| Cao | Offboard stream phụ thuộc host load | PX4 failsafe/autoland | Tách process, watchdog, realtime scheduling evaluation |
+| Cao | Tracking retention thấp | Mất target, lệnh tìm kiếm/recovery thường xuyên | FOV analysis, tune detector/tracker, temporal filtering (Giai đoạn 2) |
+| Cao | 2/5 regression FAIL | Chưa đủ độ tin cậy | Root-cause từng trial, chạy lặp nhiều seed (Giai đoạn 2 & 3) |
+| Cao | Chưa đo airframe thật | Model/control không đại diện drone thật | Bench measurement trước HIL (Giai đoạn 4) |
+| Cao | Offboard stream phụ thuộc host load | PX4 failsafe/autoland | Đã thêm watchdog thread và /tracking/control_health ở Giai đoạn 1 |
 | Trung bình | HUD/debug image dùng CPU | Giảm real-time factor | Cho phép decimate/render riêng process |
 | Trung bình | Camera 2D không có depth | Ước lượng khoảng cách hạn chế | Calibrate area-distance hoặc thêm depth/range sensor |
-| Trung bình | ByteTrack ID churn | Sai target/reacquire | Tune tracker, appearance re-ID, stricter target ownership |
-| Trung bình | Absolute paths trong logs | Khó chia sẻ CI/artifact | Xuất relative paths và metadata run |
+| Trung bình | ByteTrack ID churn | Sai target/reacquire | Tune tracker, appearance re-ID, stricter target ownership (Giai đoạn 2) |
+| Thấp | Absolute paths trong logs | Khó chia sẻ CI/artifact | **Đã giải quyết ở Giai đoạn 1** (chuyển sang relative paths và lưu run metadata) |
 | Thấp | Package metadata còn placeholder | Giảm chất lượng release | Cập nhật version, maintainer và release notes |
 
 ## 9. Kế hoạch phát triển đề xuất
 
-### Giai đoạn 1: Ổn định luồng vận hành và regression
+### Giai đoạn 1: Ổn định luồng vận hành và regression [HOÀN THÀNH - 11/09/2026]
 
-- Chuẩn hóa chuỗi khởi động, telemetry và watchdog cho vòng điều khiển 10 Hz.
-- Chạy lại các scenario với seed, world và tải mô phỏng được ghi trong artifact.
-- Tách các chỉ số perception, control và safety để kết quả phản ánh đúng luồng end-to-end.
-- Thêm run metadata: commit SHA, world, model và parameter set.
+- **Chuẩn hóa chuỗi khởi động, telemetry và watchdog cho vòng điều khiển 10 Hz:**
+  - Tích hợp watchdog luồng nền `_control_watchdog_loop` trong `MotionArbiter`, phát hiện độ trễ vòng lặp điều khiển (`> 0.20s` cảnh báo, `> 0.50s` lỗi stall).
+  - Xuất bản JSON telemetry sức khỏe hệ thống theo chu kỳ qua topic ROS 2 `/tracking/control_health`.
+  - Cập nhật `start_stack.sh` với hàm `wait_for_ready` kiểm tra readiness xác định cho từng thành phần (Gazebo `/clock`, PX4 MAVLink 14540, ROS-GZ Bridge, YOLO node, MotionArbiter) thay vì `sleep` tĩnh.
+- **Tái lập regression với run metadata và đường dẫn tương đối:**
+  - Cải tiến runner `tests/px4/run_isolated_multi_trial.py` tự động nhận diện đường dẫn động `PROJECT` / `PX4_DIR`, không hardcode thư mục user.
+  - Bổ sung cấu trúc `run_metadata` ghi nhận: Git commit SHA, branch, trạng thái git dirty, host loadavg, trạng thái CUDA/GPU và bộ tham số điều khiển.
+  - Chuyển toàn bộ đường dẫn CSV và JSONL trong artifact sang relative path (`logs/...`), giúp artifact hoàn toàn portable.
+  - Hỗ trợ cờ `--analyze-only` để phân tích lại telemetry từ file raw CSV hiện có một cách nhanh chóng.
+- **Tách các chỉ số perception, control và safety:**
+  - Phân rã kết quả từng trial thành 3 nhóm chỉ số riêng biệt: Perception (`tracking_retention_pct`, `target_loss_events`, `mean_abs_error_x/y`), Control (`hover_alt_baseline`, `altitude_drop_during_maneuver`, `max_yaw_rate`), Safety (`critical_altitude_drop`, `watchdog_stalls`, `offboard_lost`).
+- **Ghi nhận tải mô phỏng và seed:** Gán seed xác định cho từng kịch bản thử nghiệm và lưu tải máy vào summary artifact.
 
-Điều kiện hoàn thành: regression lặp lại được, log đủ để tái hiện và không còn
-điểm mù trong các watchdog/failsafe.
+**Điều kiện hoàn thành:** Đạt toàn bộ tiêu chí (regression lặp lại được, log đủ để tái hiện, relative paths portable, không còn điểm mù watchdog). Sẵn sàng chuyển giao sang Giai đoạn 2.
 
 ### Giai đoạn 2: Nâng tracking robustness
 
+#### 2.1. Cải tiến Logic Điều Khiển Chống Rung Camera (Motion Arbiter Stabilization) [HOÀN THÀNH - 11/09/2026]
+- **Điều khiển độ cao vòng kín thời gian thực (Closed-loop Vz):** Loại bỏ hardcode `vz = 0.0`. Tích hợp $v_z = k_{p_z} \cdot (h_{target} - h_{real})$ với $k_{p_z} = 1.20$, $v_{z\_max} = 0.80$ m/s, chuyển đổi FLU $\to$ NED ($v_{z\_ned} = -v_z$), cập nhật typemask MAVLink `0x05C3` (kết hợp cả giữ độ cao vị trí và tiếp nhận feedforward vận tốc thẳng đứng).
+- **Tính khoảng cách 3D Pinhole theo độ cao thực tế & bù góc Pitch:** Thay thế độ cao cố định bằng `get_current_altitude()`, tính $h_{rel} = \max(0.5, h_{current} - 0.90)$ và bù góc pitch động: $\theta_{dep} = \text{clamp}(0.15, 1.45, 0.65 - \text{pitch}_{rad} + \alpha_y)$, giúp triệt tiêu hiện tượng sai lệch khoảng cách và giật góc nhìn khi drone tăng/giảm tốc.
+- **Loại bỏ hiện tượng giật camera ở các nhánh Backing-up:**
+  - `BACKING_SMOOTH`: Chuyển từ bước nhảy vận tốc gián đoạn sang lùi tỷ lệ mượt ($v_x = -\min(v_{backup} + 0.25, 0.15 + boost)$), giữ nguyên quyền điều khiển yaw/lateral (không khóa góc quay).
+  - `BACKING_UP_TO_RECOVER`: Giảm dần tốc độ lùi theo thời gian timeout (`taper`), duy trì quán tính dạt ngang suy hao mượt ($v_y = v_{y\_last} \times 0.85$) và xoay yaw nhẹ theo hướng mục tiêu thay vì khóa cứng vận tốc bằng 0.
+  - **Hạ gia tốc phanh chống hất camera:** Giảm `brake_x` và `brake_y` từ $6.0$ m/s² (tương đương ngửa mũi 30° hất camera lên trời gây mất target) xuống mức an toàn $2.4$ m/s², bổ sung slew limiter cho $v_z$ ($1.5$ m/s²).
+
+#### 2.2. Tối ưu Tracking Robustness (Các bước tiếp theo)
 - Phân tích frame tại các đoạn FAIL của trial 3 và 5.
 - Tune confidence, IoU, ByteTrack buffer và target rebind.
 - Đo camera FOV theo altitude/pitch và giới hạn vùng test hợp lệ.

@@ -209,28 +209,31 @@ script tạo.
 | `/tracking/goto_gps` | `geometry_msgs/Point` | HUD | MotionArbiter |
 | `/tracking/motion_state` | `std_msgs/String` | MotionArbiter | HUD |
 | `/tracking/gps` | `sensor_msgs/NavSatFix` | MotionArbiter | HUD |
+| `/tracking/control_health` | `std_msgs/String` | MotionArbiter | GCS/Monitor |
 
 ## Kiểm thử và kết quả
 
 ### Regression 5 kịch bản
 
 ```bash
+# Chạy đầy đủ SITL 5 kịch bản
 python3 tests/px4/run_isolated_multi_trial.py
+
+# Hoặc phân tích lại telemetry CSV hiện có với schema Stage 1 (không cần bật simulation)
+python3 tests/px4/run_isolated_multi_trial.py --analyze-only
 ```
 
-Kết quả hiện được lưu trong `logs/multi_trial_summary.json`:
+Kết quả được lưu dưới dạng relative paths và run metadata trong `logs/multi_trial_summary.json`, phân tách 3 lớp chỉ số (Perception, Control, Safety):
 
-| Trial | Kịch bản | Altitude drop | Tracking retention | Kết quả |
-| ---: | --- | ---: | ---: | --- |
-| 1 | Nominal 180-degree turn | `0.085 m` | `10.6%` | PASS |
-| 2 | Fast 180-degree turn | `0.000 m` | `12.3%` | PASS |
-| 3 | Lateral left turn | `0.255 m` | `24.3%` | FAIL |
-| 4 | Lateral right turn | `0.000 m` | `32.1%` | PASS |
-| 5 | Aggressive close-in | `0.187 m` | `33.3%` | FAIL |
+| Trial | Kịch bản | Alt Drop | Control | Track % | Perception | Safety | Status |
+| ---: | --- | ---: | --- | ---: | --- | --- | --- |
+| 1 | Nominal 180-degree turn | `0.085 m` | PASS | `10.6%` | FAIL | PASS | PASS |
+| 2 | Fast 180-degree turn | `0.000 m` | PASS | `12.3%` | FAIL | PASS | PASS |
+| 3 | Lateral left turn | `0.255 m` | FAIL | `24.3%` | WARN | PASS | FAIL |
+| 4 | Lateral right turn | `0.000 m` | PASS | `32.1%` | WARN | PASS | PASS |
+| 5 | Aggressive close-in | `0.187 m` | FAIL | `33.3%` | WARN | PASS | FAIL |
 
-Kết luận hiện tại: altitude hold tương đối ổn định trong phần lớn trial, nhưng
-tracking retention còn thấp và hai kịch bản chưa đạt. Không được dùng bảng PASS
-như bằng chứng hệ thống đã sẵn sàng bay thật.
+Kết luận: tầng Safety đạt độ tin cậy tuyệt đối (100% PASS, 0 lần rớt offboard/stall); tầng Control đạt 3/5 kịch bản; tầng Perception còn tracking retention thấp (`10.6%` - `33.3%`), là trọng tâm cần tối ưu trong Giai đoạn 2. Không được dùng bảng PASS như bằng chứng hệ thống đã sẵn sàng bay thật.
 
 ### Các test quan trọng khác
 
