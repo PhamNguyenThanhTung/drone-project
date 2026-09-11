@@ -57,13 +57,13 @@ class YoloDetectorNode(Node):
         self.declare_parameter('min_aspect_ratio', 0.70)
         self.declare_parameter('max_aspect_ratio', 4.80)
         self.declare_parameter('bottom_margin_ratio', 0.0)
-        self.declare_parameter('show_debug_image', False)
+        self.declare_parameter('show_debug_image', True)
         self.declare_parameter('target_timeout', 4.0)
         # ByteTrack hands out a fresh track id whenever a person is missed for
         # a few frames (very common at CPU frame rates). Without re-binding,
         # a manual lock died the instant the id changed. These two knobs bound
         # how long and how far the lock may follow such an id switch.
-        self.declare_parameter('lock_reacquire_s', 2.5)
+        self.declare_parameter('lock_reacquire_s', 5.0)
         self.declare_parameter('reacquire_min_iou', 0.15)
         self.declare_parameter('log_period', 1.5)
         self.declare_parameter('max_frame_rate', 0.0)

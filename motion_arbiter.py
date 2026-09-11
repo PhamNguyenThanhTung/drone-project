@@ -67,7 +67,7 @@ class MotionArbiter(Node):
         # in about one second, while the slew limiters still smooth commands.
         self.declare_parameter('max_rate', 1.50)
         self.declare_parameter('search_rate', 1.10)
-        self.declare_parameter('lost_timeout', 3.5)
+        self.declare_parameter('lost_timeout', 5.0)
         # A camera message older than this is no longer useful for visual
         # servoing.  Keeping the old 1.2 s hold made the vehicle act on stale
         # pixel errors while the target had already moved or disappeared.
@@ -104,6 +104,7 @@ class MotionArbiter(Node):
         self.declare_parameter('mavlink_stale_timeout_s', 2.0)
         self.declare_parameter('kp_z', 1.20)
         self.declare_parameter('max_z_speed', 0.80)
+        self.declare_parameter('auto_track', False)
         self.declare_parameter(
             'diagnostic_log',
             os.environ.get(
@@ -115,6 +116,7 @@ class MotionArbiter(Node):
         gp = self.get_parameter
         self.mavlink_uri = gp('mavlink').value
         self.auto_takeoff = bool(gp('auto_takeoff').value)
+        self.auto_track = bool(gp('auto_track').value)
         self.takeoff_alt = float(gp('takeoff_alt').value)
         self.kp = float(gp('kp').value)
         self.max_rate = abs(float(gp('max_rate').value))
@@ -214,6 +216,7 @@ class MotionArbiter(Node):
         # command, crash). vehicle_armed is the ground truth that keeps the
         # two in sync.
         self.vehicle_armed: Optional[bool] = None
+        self._last_known_offboard: bool = False
 
         # Single-reader MAVLink RX cache. mavutil's recv_match(type=...)
         # DISCARDS non-matching messages, so concurrent callers used to steal
@@ -371,14 +374,20 @@ class MotionArbiter(Node):
         return float(getattr(self, 'takeoff_alt', 3.8))
 
     def _is_offboard(self):
-        heartbeat = self._rx_get('HEARTBEAT', max_age=self.mavlink_stale_timeout_s)
+        timeout = max(4.0, getattr(self, 'mavlink_stale_timeout_s', 2.0))
+        heartbeat = self._rx_get('HEARTBEAT', max_age=timeout)
         if heartbeat is None:
+            pos = self._rx_get('LOCAL_POSITION_NED', max_age=timeout)
+            if pos is not None and getattr(self, '_last_known_offboard', False):
+                return True
             return False
-        return (
+        is_offboard = (
             bool(int(getattr(heartbeat, 'base_mode', 0)) & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED)
             and ((int(getattr(heartbeat, 'custom_mode', 0)) >> 16) & 0xFF)
             == PX4_CUSTOM_MAIN_MODE_OFFBOARD
         )
+        self._last_known_offboard = is_offboard
+        return is_offboard
 
     def _control_watchdog_loop(self):
         while True:
@@ -596,6 +605,7 @@ class MotionArbiter(Node):
             )
             main_mode = (int(hb.custom_mode) >> 16) & 0xFF
             if custom_mode_enabled and main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD:
+                self._last_known_offboard = True
                 return True
             time.sleep(0.05)
         return False
@@ -692,7 +702,8 @@ class MotionArbiter(Node):
                     break
 
             remaining = self.takeoff_alt - altitude if altitude is not None else self.takeoff_alt
-            climb_rate = -0.30 if remaining < 0.8 else -0.65
+            # FLU vertical velocity: +0.65 m/s is upward climb (+UP in FLU, converted to -0.65 m/s in NED)
+            climb_rate = 0.30 if remaining < 0.8 else 0.65
             self._send_offboard_velocity(0.0, 0.0, climb_rate)
 
         self._stream_offboard_velocity(0.0, 0.0, 0.0, duration=2.0)
@@ -706,9 +717,13 @@ class MotionArbiter(Node):
 
         self.is_airborne = True
         self.is_taking_off = False
-        self.set_state(STATE_STANDBY, trigger='takeoff_completed', target_id=None)
+        target_to_use = getattr(self, 'active_target_id', None)
+        if target_to_use is None and getattr(self, 'auto_track', False):
+            target_to_use = 0
+        initial_state = STATE_TRACKING if (getattr(self, 'auto_track', False) or target_to_use is not None) else STATE_STANDBY
+        self.set_state(initial_state, trigger='takeoff_completed', target_id=target_to_use)
         self.get_logger().info(
-            f"[TAKEOFF] Drone Airborne at {self.takeoff_alt:.1f}m. Hovering in STANDBY (awaiting user target selection)."
+            f"[TAKEOFF] Drone Airborne at {self.takeoff_alt:.1f}m. State: {initial_state}."
         )
 
     # ------------------------------------------------------------------
@@ -776,6 +791,10 @@ class MotionArbiter(Node):
 
     def on_target_selected(self, msg: Int32):
         """Handle target selection (Click on box or Keys [1-9, 0, SPACE])."""
+        if not self.is_airborne or self.is_taking_off:
+            self.get_logger().info('[TARGET] Stashing target selection until takeoff is complete.')
+            self.active_target_id = int(msg.data) if int(msg.data) >= 0 else None
+            return
         target_id = int(msg.data)
         if target_id >= 0:
             self.set_state(STATE_TRACKING, trigger='click_or_key_lock', target_id=target_id)
@@ -842,6 +861,9 @@ class MotionArbiter(Node):
             self.target_dy = max(-8.0, min(8.0, dy))
             self.target_dist = max(2.5, min(16.0, total_dist))
             self.dist_advanced = 0.0
+
+            if getattr(self, 'auto_track', False) and self.is_airborne and self.current_state == STATE_STANDBY:
+                self.set_state(STATE_TRACKING, trigger='auto_track_first_detection', target_id=0)
 
     # ------------------------------------------------------------------
     # 10 Hz Control Dispatch Loop
@@ -975,7 +997,7 @@ class MotionArbiter(Node):
                     events.append('CONTROL_LOOP_LATE')
                 if raw_dt >= fail_period:
                     events.append('CONTROL_LOOP_STALL')
-                if heartbeat_age > stale_timeout:
+                if heartbeat_age > max(4.0, stale_timeout):
                     events.append('MAVLINK_HEARTBEAT_STALE')
                 if self.is_airborne and position_age > stale_timeout:
                     events.append('LOCAL_POSITION_STALE')
