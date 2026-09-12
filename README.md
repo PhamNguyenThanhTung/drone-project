@@ -40,9 +40,9 @@ Package ROS 2 hiện tại nằm trong **ros2_ws/src/vision_tracking**. setup.py
 ~~~text
 drone-project/
 ├── start_stack.sh
-├── bao_cao_du_an_day_du.html
+├── docs/
+│   └── index.html
 ├── README.md
-├── PROJECT_REPORT.md
 ├── ros2_ws/src/vision_tracking/
 │   ├── launch/tracking_stack.launch.py
 │   ├── config/*.yaml
@@ -220,7 +220,6 @@ Không tăng timeout để che stale data hoặc tuning PID trước khi xác nh
 
 Đọc thêm:
 
-- [Báo cáo HTML](bao_cao_du_an_day_du.html)
-- [Tài liệu kỹ thuật](PROJECT_REPORT.md)
+- [Báo cáo HTML](docs/index.html)
 - [Simulation realism](simulation/README.md)
 - [PX4 tests](tests/px4/README.md)
