@@ -1,58 +1,98 @@
-# Realism and safety test ladder
+# Simulation realism và failure testing
 
-`realism.yaml` is a deterministic fault-injection profile. It adds camera
-latency/frame loss/blur and, when raw topics are supplied, IMU bias + random
-noise + drift, GPS noise/dropouts, and barometer noise. Start it alongside the
-stack with:
+Thư mục này chứa profile làm suy giảm sensor có kiểm soát và công cụ failure injection. Mục tiêu là kiểm tra hành vi của autonomy stack khi dữ liệu không hoàn hảo, không phải làm simulation trông “thật” bằng các hiệu ứng không đo được.
 
-```bash
-ros2 run vision_tracking sim_realism_node --ros-args --params-file simulation/realism.yaml
-```
+## Thành phần
 
-Point the detector at the degraded stream with
-`YOLO_IMAGE_TOPIC=/simulation/camera/image`. Keep `seed` fixed for repeatable
-regression tests. Wind/turbulence and ground-effect settings belong in the
-Gazebo/PX4 airframe profile; `vehicle_profile.yaml` records the parameters and
-clearly separates the x500 SITL baseline from measurements that must come from
-the real drone (mass, inertia, thrust curve, and battery discharge curve).
+| File | Vai trò |
+| --- | --- |
+| realism.yaml | Profile delay/drop/blur/noise lặp lại được |
+| vehicle_profile.yaml | Ghi thông số baseline và các giá trị phải đo trên hardware |
+| inject_failure.py | Gửi PX4 failure commands qua MAVLink |
+| sim_realism_node.py | Implementation nằm trong ROS 2 package |
 
-Required validation gates, in order:
+## Camera realism path
 
-1. SITL: nominal and realism profile; verify estimator innovation and failsafes.
-2. HIL: real flight controller, props removed, current-limited bench supply.
-3. Propeller-less test: arm, mode changes, link/sensor/target-loss injection.
-4. Safety harness: tethered low hover in a netted area with an independent kill switch.
-5. Geofence flight: conservative polygon/radius, RTL and loss-of-GPS/MAVLink checks.
+~~~text
+/camera/image_raw
+  -> simulation_realism
+  -> optional delay/drop/blur
+  -> /simulation/camera/image
+  -> yolo_detector_node
+~~~
 
-Exercise MAVLink loss by stopping the bridge process, target loss by dropping all
-camera frames, and GPS loss by setting the GPS dropout probability to `1.0`.
-Enable PX4 geofence parameters in the test vehicle configuration and record
-the parameter dump with each run. Never skip a gate or fly with unmeasured
-airframe constants.
+Khi chạy normal mode, use_realism=false và detector nhận trực tiếp /camera/image_raw. Khi đặt SIM_REALISM=1, launch file bật node realism và override detector input.
 
-PX4-native failure injection is available after SITL starts:
+~~~bash
+SIM_REALISM=1 ./start_stack.sh
+~~~
 
-```bash
+Hoặc launch trực tiếp:
+
+~~~bash
+source /opt/ros/humble/setup.bash
+source ros2_ws/install/setup.bash
+ros2 launch vision_tracking tracking_stack.launch.py use_realism:=true
+~~~
+
+## Parameter
+
+| Parameter | Default | Ý nghĩa |
+| --- | ---: | --- |
+| camera_delay_ms | 0 | Trễ publish frame |
+| camera_drop_probability | 0 | Xác suất bỏ frame |
+| camera_motion_blur_pixels | 0 | Kernel Gaussian blur |
+| camera_queue_depth | 8 | Số frame delayed tối đa |
+| imu_noise_stddev | 0 | Noise acceleration/angular velocity |
+| imu_bias | [0,0,0] | Bias ban đầu |
+| imu_drift_per_s | [0,0,0] | Drift bias |
+| gps_noise_m | 0 | Noise vị trí tương đương mét |
+| gps_dropout_probability | 0 | Drop GPS |
+| baro_noise_pa | 0 | Pressure noise |
+| sensor_dropout_probability | 0 | Drop sensor chung |
+| seed | 7 | Seed để test lặp lại |
+
+Nếu imu_input, gps_input hoặc baro_input để trống, node không tạo subscription cho sensor đó.
+
+## Test profile đúng cách
+
+1. Chạy nominal mode và lưu baseline.
+2. Chỉ bật một loại degradation.
+3. Giữ world, seed, model và controller parameters cố định.
+4. Ghi image rate, tracking retention, vision age, control gap và Offboard state.
+5. Tăng severity theo từng bước.
+6. Không tăng timeout chỉ để biến test thành PASS.
+
+Ví dụ camera delay:
+
+~~~yaml
+simulation_realism:
+  ros__parameters:
+    camera_delay_ms: 80.0
+    camera_drop_probability: 0.05
+    camera_motion_blur_pixels: 3
+    seed: 7
+~~~
+
+## PX4 failure injection
+
+Sau khi SITL chạy:
+
+~~~bash
 python3 simulation/inject_failure.py gps off
 python3 simulation/inject_failure.py gps ok
 python3 simulation/inject_failure.py mavlink_signal off
-```
+~~~
 
-Companion-computer parity and inference-rate controls are simulation-only test
-options; see `start_stack.sh` and the setup documentation when a constrained
-run is needed. Hardware thermal or power limits are deployment concerns outside
-this safety-test guide.
+Chỉ dùng trong SITL hoặc bench/HIL có quy trình an toàn. Luôn có lệnh khôi phục, timeout test và process cleanup.
 
-## PX4 checkout patch
+## Safety ladder
 
-The project requires simulated GPS enabled for the `x500_flow` airframe. Apply
-the repository patch to a matching PX4 checkout before building SITL:
+1. SITL nominal.
+2. SITL realism/failure injection.
+3. HIL với propeller tháo rời.
+4. Bench test có nguồn giới hạn dòng và kill switch.
+5. Tethered low-hover trong vùng bảo vệ.
+6. Geofence flight.
 
-```bash
-cd /path/to/PX4-Autopilot
-git apply /path/to/drone-project/patches/4021_gz_x500_flow_gps.patch
-make px4_sitl gz_x500_flow
-```
-
-The patch targets the stock PX4 `v1.16.2` airframe file. Use
-`git apply --check` first when applying it to another PX4 revision.
+Không bỏ qua một gate vì các metric simulation đẹp. vehicle_profile.yaml phải phân biệt rõ thông số giả lập và số đo airframe thật.

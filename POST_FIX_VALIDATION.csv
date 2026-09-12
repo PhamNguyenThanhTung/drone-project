@@ -1,0 +1,9 @@
+trial,control_mean,control_std,max_control_gap,max_setpoint_gap,offboard_loss,watchdog_stall,vision_mean_age,vision_p95,manual_tracking_conflict,gazebo_instances,px4_cpu_peak,result
+TRIAL_01,0.2136,0.7496,5.129,5.6419,0,0,0.075,0.11,0,1,4.0,PASS WITH KNOWN LIMITATIONS
+TRIAL_02,0.2293,0.7976,5.127,5.6397,0,2,0.075,0.11,0,1,4.7,FAIL
+TRIAL_03,0.2258,0.7875,5.144,5.6584,0,3,0.075,0.11,0,1,4.5,FAIL
+TRIAL_04,0.2071,0.7276,5.126,5.6386,0,3,0.075,0.11,0,1,4.4,FAIL
+TRIAL_05,0.25,0.8558,5.122,5.6342,0,4,0.075,0.11,0,1,4.0,FAIL
+TRIAL_06,0.222,0.774,5.12,5.632,0,4,0.075,0.11,0,1,4.8,FAIL
+TRIAL_07,0.3199,1.0281,5.118,5.6298,0,3,0.075,0.11,0,1,4.5,FAIL
+TRIAL_08,0.223,0.7762,5.114,5.6254,0,3,0.075,0.11,0,1,4.8,FAIL

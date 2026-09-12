@@ -1,0 +1,26 @@
+yolo_detector_node:
+  ros__parameters:
+    image_topic: "/camera/image_raw"
+    error_topic: "/tracking/error"
+    debug_image_topic: "/tracking/debug_image"
+    model_path: "yolov8n.pt"
+    tracker: "bytetrack.yaml"
+    device: "cpu"
+    img_width: 416
+    img_height: 416
+    infer_native: true
+    infer_imgsz: 0
+    conf: 0.45
+    iou: 0.45
+    classes: [0]
+    min_box_area_ratio: 0.0003
+    max_box_area_ratio: 0.85
+    min_aspect_ratio: 0.70
+    max_aspect_ratio: 4.80
+    bottom_margin_ratio: 0.0
+    show_debug_image: true
+    target_timeout: 4.0
+    lock_reacquire_s: 5.0
+    reacquire_min_iou: 0.15
+    log_period: 1.5
+    max_frame_rate: 0.0

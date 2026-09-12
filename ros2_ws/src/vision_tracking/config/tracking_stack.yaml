@@ -1,0 +1,103 @@
+# ==============================================================================
+# Unified ROS 2 Configuration for Vision Tracking Stack
+# Nodes: yolo_detector_node, motion_arbiter, live_camera_hud, simulation_realism
+# ==============================================================================
+
+yolo_detector_node:
+  ros__parameters:
+    image_topic: "/camera/image_raw"
+    error_topic: "/tracking/error"
+    debug_image_topic: "/tracking/debug_image"
+    model_path: "yolov8n.pt"
+    tracker: "bytetrack.yaml"
+    device: "cpu"
+    img_width: 416
+    img_height: 416
+    infer_native: true
+    infer_imgsz: 0
+    conf: 0.45
+    iou: 0.45
+    classes: [0]
+    min_box_area_ratio: 0.0003
+    max_box_area_ratio: 0.85
+    min_aspect_ratio: 0.70
+    max_aspect_ratio: 4.80
+    bottom_margin_ratio: 0.0
+    show_debug_image: true
+    target_timeout: 4.0
+    lock_reacquire_s: 5.0
+    reacquire_min_iou: 0.15
+    log_period: 1.5
+    max_frame_rate: 0.0
+
+motion_arbiter:
+  ros__parameters:
+    mavlink: "udpin:0.0.0.0:14540"
+    auto_takeoff: true
+    takeoff_alt: 3.8
+    kp: 0.0070
+    max_rate: 1.50
+    search_rate: 1.10
+    lost_timeout: 5.0
+    vision_fresh_timeout: 0.40
+    enable_forward: true
+    default_walk_speed: 1.15
+    default_backup_speed: 1.10
+    kp_y_boost: 0.0050
+    kp_lateral: 0.0035
+    deadband_x: 25.0
+    deadband_y: 30.0
+    max_forward_speed: 1.80
+    min_forward_speed: -1.50
+    tree_clearance_margin: 1.8
+    teleop_timeout: 0.5
+    goto_altitude: 3.8
+    bottom_backup_timeout: 1.4
+    bottom_recovery_timeout: 2.5
+    turn_point_timeout: 3.2
+    turn_point_speed: 1.15
+    target_area_min: 6000.0
+    target_area_max: 13000.0
+    kp_area: 0.00015
+    control_period_s: 0.10
+    control_warn_period_s: 0.20
+    control_fail_period_s: 0.50
+    health_publish_period_s: 0.50
+    mavlink_stale_timeout_s: 2.0
+    kp_z: 1.20
+    max_z_speed: 0.80
+    small_box_max_speed: 0.25
+    auto_track: false
+    wait_for_vision_before_takeoff: true
+    diagnostic_log: "logs/tracking_diagnostics.jsonl"
+
+live_camera_hud:
+  ros__parameters:
+    topic: "/tracking/debug_image"
+    teleop_speed: 2.0
+    teleop_z_speed: 1.0
+    teleop_yaw_speed: 1.10
+    map_radius_m: 25.0
+
+simulation_realism:
+  ros__parameters:
+    camera_input: "/camera/image_raw"
+    camera_output: "/simulation/camera/image"
+    camera_delay_ms: 0.0
+    camera_drop_probability: 0.0
+    camera_motion_blur_pixels: 0
+    camera_queue_depth: 8
+    imu_input: ""
+    imu_output: "/simulation/imu"
+    imu_noise_stddev: 0.0
+    imu_bias: [0.0, 0.0, 0.0]
+    imu_drift_per_s: [0.0, 0.0, 0.0]
+    gps_input: ""
+    gps_output: "/simulation/gps"
+    gps_noise_m: 0.0
+    gps_dropout_probability: 0.0
+    baro_input: ""
+    baro_output: "/simulation/baro"
+    baro_noise_pa: 0.0
+    sensor_dropout_probability: 0.0
+    seed: 7

@@ -45,32 +45,61 @@ echo "Gazebo World: ${WORLD_NAME}"
 echo "Quadcopter Model: ${PX4_SIM_MODEL}"
 echo "PX4 SITL Target: ${PX4_GZ_TARGET}"
 
-# Dọn dẹp process cũ
-# Match only the PX4 runtime executable.  A broad `-f px[4]` also matches
-# this script's `make px4_sitl` command and can kill the build before startup.
+# Dọn dẹp process cũ thuộc stack này
+pkill -TERM -x px4 2>/dev/null || true
+pkill -TERM -f "tracking_stack.launch.p[y]" 2>/dev/null || true
+pkill -TERM -f "gz.*${WORLD_NAME}" 2>/dev/null || true
+pkill -TERM -f "sleep infinity" 2>/dev/null || true
+sleep 0.5
 pkill -9 -x px4 2>/dev/null || true
-pkill -9 -f "gz si[m]" 2>/dev/null || true
-pkill -9 -f "mavproxy.p[y]" 2>/dev/null || true
-pkill -9 -f "parameter_brid[g]e" 2>/dev/null || true
-pkill -9 -f "yolo_detector_nod[e]" 2>/dev/null || true
-pkill -9 -f "sim_realism_nod[e]" 2>/dev/null || true
-pkill -9 -f "motion_arbite[r]" 2>/dev/null || true
-pkill -9 -f "live_camera_hu[d]" 2>/dev/null || true
-pkill -9 -f "QGroundControl" 2>/dev/null || true
-sleep 1
+pkill -9 -f "tracking_stack.launch.p[y]" 2>/dev/null || true
+pkill -9 -f "gz.*${WORLD_NAME}" 2>/dev/null || true
+pkill -9 -f "sleep infinity" 2>/dev/null || true
+
+kill_process_tree() {
+  local parent_pid="$1"
+  local sig="${2:-TERM}"
+  if [[ -z "$parent_pid" ]] || ! kill -0 "$parent_pid" 2>/dev/null; then
+    return 0
+  fi
+  local children
+  children=$(pgrep -P "$parent_pid" 2>/dev/null || true)
+  for child in $children; do
+    kill_process_tree "$child" "$sig"
+  done
+  kill -"$sig" "$parent_pid" 2>/dev/null || true
+}
+
+cleanup_pid() {
+  local pid="$1"
+  local name="$2"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "Dừng $name (PID $pid và tiến trình con)..."
+    kill_process_tree "$pid" TERM
+    local count=0
+    while kill -0 "$pid" 2>/dev/null && (( count < 10 )); do
+      sleep 0.2
+      ((count++))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill_process_tree "$pid" KILL
+    fi
+  fi
+}
 
 cleanup() {
-  if [[ -n "${GZ_PID:-}" ]]; then kill -TERM "$GZ_PID" 2>/dev/null || true; fi
-  if [[ -n "${GZ_GUI_PID:-}" ]]; then kill -TERM "$GZ_GUI_PID" 2>/dev/null || true; fi
-  if [[ -n "${QGC_PID:-}" ]]; then kill -TERM "$QGC_PID" 2>/dev/null || true; fi
-  pkill -TERM -f "QGroundControl" 2>/dev/null || true
-  pkill -TERM -f "live_camera_hu[d]" 2>/dev/null || true
-  pkill -TERM -f "motion_arbite[r]" 2>/dev/null || true
-  pkill -TERM -f "yolo_detector_nod[e]" 2>/dev/null || true
-  pkill -TERM -f "sim_realism_nod[e]" 2>/dev/null || true
-  pkill -TERM -f "parameter_brid[g]e" 2>/dev/null || true
-  if [[ -z "${GZ_PID:-}" ]]; then pkill -TERM -f "gz si[m]" 2>/dev/null || true; fi
+  echo "--- Đang dọn dẹp hệ thống ---"
+  cleanup_pid "${STACK_PID:-}" "ROS Tracking Stack"
+  cleanup_pid "${GZ_GUI_PID:-}" "Gazebo GUI"
+  cleanup_pid "${GZ_PID:-}" "Gazebo Server"
+  cleanup_pid "${PX4_PID:-}" "PX4 SITL Pipeline"
+  cleanup_pid "${QGC_PID:-}" "QGroundControl"
+
+  # Targeted compatibility fallback for lingering stack components
+  pkill -TERM -f "tracking_stack.launch.p[y]" 2>/dev/null || true
+  pkill -TERM -f "gz.*${WORLD_NAME}" 2>/dev/null || true
   pkill -TERM -x px4 2>/dev/null || true
+  pkill -TERM -f "sleep infinity" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -201,7 +230,7 @@ if [[ "${HEADLESS:-0}" != "1" ]]; then
   GZ_GUI_PID=$!
 fi
 
-(cd "${PX4_DIR}" && make px4_sitl "${PX4_GZ_TARGET}") > /tmp/px4_sim.log 2>&1 &
+( sleep infinity | (cd "${PX4_DIR}" && make px4_sitl "${PX4_GZ_TARGET}") ) > /tmp/px4_sim.log 2>&1 &
 PX4_PID=$!
 wait_for_ready "PX4 SITL (MAVLink 14540)" "$PX4_PID" /tmp/px4_sim.log 30 "grep -q 'Ready for takeoff!' /tmp/px4_sim.log || grep -q 'mavlink start' /tmp/px4_sim.log || ss -ulpn 2>/dev/null | grep -q 14540"
 MAVLINK_FORWARDING_OK=0
@@ -219,27 +248,10 @@ if [[ "${MAVLINK_FORWARDING_OK}" != "1" ]] && rg -q 'MAVLink only on localhost' 
   echo "WARNING: PX4 reports MAVLink as localhost-only; check MAV_0_BROADCAST in PX4." >&2
 fi
 
-echo "[2/5] Khởi động ROS 2 parameter bridge..."
-# Bridge cho Camera Image
-ros2 run ros_gz_bridge parameter_bridge \
-  "/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image" > /tmp/ros_bridge.log 2>&1 &
-BRIDGE_PID=$!
-wait_for_ready "ROS-Gazebo bridge (/camera/image_raw)" "$BRIDGE_PID" /tmp/ros_bridge.log 15 "ros2 topic list 2>/dev/null | grep -q '/camera/image_raw'"
+echo "[2/5] Khởi động ROS 2 Tracking Stack (Bridge, YOLO, MotionArbiter, HUD)..."
+LAUNCH_REALISM=$([[ "${SIM_REALISM:-0}" == "1" ]] && echo "true" || echo "false")
+LAUNCH_HUD=$([[ "${SHOW_HUD:-1}" == "1" ]] && echo "true" || echo "false")
 
-if [[ "${SIM_REALISM:-0}" == "1" ]]; then
-  echo "[2b/5] Bật sensor/camera realism profile..."
-  ros2 run vision_tracking sim_realism_node --ros-args \
-    --params-file "${PROJECT_DIR}/simulation/realism.yaml" > /tmp/sim_realism.log 2>&1 &
-  REALISM_PID=$!
-  wait_for_ready "Simulation Realism" "$REALISM_PID" /tmp/sim_realism.log 10 "ros2 topic list 2>/dev/null | grep -q '/simulation/camera/image'"
-  YOLO_IMAGE_TOPIC="${YOLO_IMAGE_TOPIC:-/simulation/camera/image}"
-else
-  YOLO_IMAGE_TOPIC="${YOLO_IMAGE_TOPIC:-/camera/image_raw}"
-fi
-
-echo "[3/5] Khởi động YOLO Detector..."
-# YOLO is intentionally CUDA-first.  Do not silently fall back to CPU: that
-# hides a broken WSL/NVIDIA passthrough and makes tracking latency unpredictable.
 YOLO_DEVICE="${YOLO_DEVICE:-cuda:0}"
 if [[ "${YOLO_DEVICE,,}" == cuda* ]]; then
   if ! python3 -c 'import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
@@ -252,56 +264,36 @@ if [[ "${YOLO_DEVICE,,}" == cuda* ]]; then
 else
   echo "YOLO device override: ${YOLO_DEVICE}"
 fi
-COMPANION_CPUSET="${COMPANION_CPUSET:-}"
-if [[ -n "${COMPANION_CPUSET}" ]]; then
-  COMPANION_RUN=(taskset -c "${COMPANION_CPUSET}")
-  echo "Companion CPU affinity: ${COMPANION_CPUSET}"
-else
-  COMPANION_RUN=()
-fi
-if [[ "${SHOW_HUD:-1}" == "1" ]]; then
-  YOLO_DEBUG=True
-else
-  YOLO_DEBUG="${YOLO_DEBUG:-False}"
-fi
-"${COMPANION_RUN[@]}" ros2 run vision_tracking yolo_detector_node \
-  --ros-args -p image_topic:=${YOLO_IMAGE_TOPIC} \
-  -p model_path:=${YOLO_MODEL:-${PROJECT_DIR}/yolov8n.pt} \
-  -p device:=${YOLO_DEVICE} -p infer_imgsz:=${YOLO_IMGSZ:-640} \
-  -p max_frame_rate:=${YOLO_MAX_FPS:-0.0} \
-  -p show_debug_image:=${YOLO_DEBUG:-False} -p conf:=${YOLO_CONF:-0.45} > /tmp/yolo.log 2>&1 &
-YOLO_PID=$!
-wait_for_ready "YOLO detector (/tracking/error)" "$YOLO_PID" /tmp/yolo.log 25 "ros2 topic list 2>/dev/null | grep -q '/tracking/error'"
 
-echo "[4/5] Khởi động MotionArbiter (PX4 OFFBOARD State Machine & Watchdog)..."
 TAKEOFF_ALT="${TAKEOFF_ALT:-3.8}"
 printf -v TAKEOFF_ALT_ROS '%.6f' "${TAKEOFF_ALT}"
 echo "Auto takeoff altitude: ${TAKEOFF_ALT_ROS} m"
-"${COMPANION_RUN[@]}" python3 "${PROJECT_DIR}/motion_arbiter.py" \
-  --ros-args -p takeoff_alt:=${TAKEOFF_ALT_ROS} -p auto_takeoff:=True -p mavlink:=udpin:0.0.0.0:14540 > /tmp/motion_arbiter.log 2>&1 &
-ARBITER_PID=$!
-wait_for_ready "MotionArbiter (/tracking/control_health)" "$ARBITER_PID" /tmp/motion_arbiter.log 25 "ros2 topic list 2>/dev/null | grep -q '/tracking/control_health'"
 
-echo "[5/5] Cấu hình QGroundControl & HUD..."
+ros2 launch vision_tracking tracking_stack.launch.py \
+  use_bridge:=true \
+  use_realism:="${LAUNCH_REALISM}" \
+  show_hud:="${LAUNCH_HUD}" \
+  yolo_device:="${YOLO_DEVICE}" \
+  takeoff_alt:="${TAKEOFF_ALT_ROS}" > /tmp/ros_tracking_stack.log 2>&1 &
+STACK_PID=$!
+ln -sf /tmp/ros_tracking_stack.log /tmp/motion_arbiter.log
+ln -sf /tmp/ros_tracking_stack.log /tmp/yolo.log
+ln -sf /tmp/ros_tracking_stack.log /tmp/ros_bridge.log
+ln -sf /tmp/ros_tracking_stack.log /tmp/camera_hud.log
+
+wait_for_ready "ROS-Gazebo bridge (/camera/image_raw)" "$STACK_PID" /tmp/ros_tracking_stack.log 20 "ros2 topic list --no-daemon 2>/dev/null | grep -q '/camera/image_raw'"
+wait_for_ready "YOLO detector (/tracking/error)" "$STACK_PID" /tmp/ros_tracking_stack.log 30 "ros2 topic list --no-daemon 2>/dev/null | grep -q '/tracking/error'"
+wait_for_ready "MotionArbiter (/tracking/control_health)" "$STACK_PID" /tmp/ros_tracking_stack.log 25 "ros2 topic list --no-daemon 2>/dev/null | grep -q '/tracking/control_health'"
+
+echo "[3/5] Cấu hình QGroundControl..."
 launch_qgroundcontrol
-
-if [[ "${SHOW_HUD:-1}" == "1" ]]; then
-  echo "Mở cửa sổ camera YOLO & HUD..."
-  python3 "${PROJECT_DIR}/live_camera_hud.py" \
-    --topic /tracking/debug_image > /tmp/camera_hud.log 2>&1 &
-  HUD_PID=$!
-  sleep 1
-  require_alive "$HUD_PID" "Camera HUD" /tmp/camera_hud.log
-fi
 
 echo "======================================================="
 echo "   PX4 AUTOPILOT + GAZEBO HARMONIC SẴN SÀNG!            "
 echo "======================================================="
 echo "   - Gazebo Harmonic      [PID: ${GZ_PID}]  READY (world: ${WORLD_NAME})"
 echo "   - PX4 SITL Autopilot   [PID: ${PX4_PID}] READY (MAVLink 14540)"
-echo "   - ROS-GZ Bridge        [PID: ${BRIDGE_PID}] READY (/camera/image_raw)"
-echo "   - YOLO Detector Node   [PID: ${YOLO_PID}] READY (/tracking/error)"
-echo "   - MotionArbiter (10Hz) [PID: ${ARBITER_PID}] READY (/tracking/control_health)"
+echo "   - ROS Tracking Stack   [PID: ${STACK_PID}] READY (/tracking/control_health)"
 if [[ -n "${QGC_PID:-}" ]] && kill -0 "${QGC_PID}" 2>/dev/null; then
   echo "   - QGroundControl       [PID: ${QGC_PID}] CONNECTED (UDP 14550)"
 else

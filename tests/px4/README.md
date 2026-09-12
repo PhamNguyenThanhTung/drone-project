@@ -1,54 +1,113 @@
-# PX4 Tests
+# PX4 và SITL test guide
 
-PX4 and MAVLink integration checks live here, separated from application code.
+Các script trong thư mục này kiểm tra PX4/MAVLink, camera-perception, MotionArbiter và dynamic tracking scenarios.
 
-Run a test from the repository root so shared modules and paths resolve:
+## Chuẩn bị
 
-```bash
+Chạy từ repository root:
+
+~~~bash
+cd ~/drone-project
 source /opt/ros/humble/setup.bash
-PYTHONPATH=.:$PYTHONPATH python3 tests/px4/<script>.py
-```
+source ros2_ws/install/setup.bash
+export PYTHONPATH=.:$PYTHONPATH
+~~~
 
-Preserve the ROS-provided `PYTHONPATH`: replacing it with only `.` hides
-generated message packages such as `geometry_msgs`.
+Không thay thế PYTHONPATH bằng dấu chấm duy nhất vì sẽ che các ROS-generated message packages.
 
-The scripts cover baseline MAVLink/MAVSDK flights, offboard climb and axis
-checks, live-message verification, the motion-arbiter state machine, and the
-camera-driven approach check (`test_approach_camera.py`, uses the
-`person_tracking_approach` world whose actor paces 3–8 m ahead of the drone),
-as well as the 5-scenario isolated regression runner (`run_isolated_multi_trial.py`).
+Đặt PX4_DIR nếu checkout PX4 không ở vị trí mặc định:
 
-These are live SITL tests. They may start PX4/Gazebo processes and resolve the
-PX4-Autopilot directory automatically or via the `PX4_DIR` environment variable
-(default: `../PX4-Autopilot` or `/home/tungt/PX4-Autopilot`).
+~~~bash
+export PX4_DIR=/path/to/PX4-Autopilot
+~~~
 
-```bash
-# Chạy multi-trial regression đầy đủ (SITL):
+## Test groups
+
+| Script | Phạm vi |
+| --- | --- |
+| px4_baseline_test.py | Arm, takeoff, hold, land |
+| px4_mavsdk_baseline.py | Baseline qua MAVSDK |
+| test_offboard_climb.py | Offboard setpoint và altitude |
+| test_mavsdk_axes.py | Kiểm tra axis/frame |
+| test_mavlink_live.py | MAVLink endpoint và telemetry |
+| test_msg_live.py | Message availability |
+| px4_axis_and_statemachine_test.py | Axis và state behavior |
+| test_approach_camera.py | Camera → YOLO → tracking/error |
+| test_person_turnaround_live.py | Turnaround tracking |
+| test_long_path_tracking.py | World đường dài |
+| run_isolated_multi_trial.py | Năm dynamic scenarios |
+| verify_live_flight.py | Live SITL integration checks |
+
+Một số test legacy vẫn gọi motion_arbiter.py ở repository root để giữ nguyên fixture/subprocess contract cũ. Normal stack hiện tại dùng ROS 2 package entry point motion_arbiter_node qua tracking_stack.launch.py. Không dùng kết quả legacy test để mô tả topology runtime hiện tại nếu chưa đối chiếu.
+
+## Multi-trial regression
+
+~~~bash
 python3 tests/px4/run_isolated_multi_trial.py
+~~~
 
-# Hoặc phân tích offline các file raw CSV hiện có:
+Phân tích lại CSV hiện có:
+
+~~~bash
 python3 tests/px4/run_isolated_multi_trial.py --analyze-only
-```
+~~~
 
-## Gotchas
+Output chính:
 
-- **MAV_CMD_NAV_TAKEOFF via pymavlink must use all-NaN params** (plus a
-  `MIS_TAKEOFF_ALT` PARAM_SET). PX4 1.14 ACKs the command with a finite
-  `param7` but the takeoff task then never generates setpoints — thrust stays
-  at 0 and `COM_DISARM_PRFLT` auto-disarms 10 s after arming. MAVSDK works
-  because it sends NaN params. Verified by traffic capture on 2026-08-25.
-- **PX4 ends the takeoff phase ~1 acceptance radius below the commanded
-  altitude** (`NAV_MC_ALT_RAD`, 0.8 m default) and loiters there: commanding
-  4.0 m only ever holds ~3.2 m. Command 5.0 m when the test needs ≥ 3.8 m
-  of actual altitude.
-- **PX4 only resolves `PX4_GZ_WORLD` against its own worlds dir**
-  (`Tools/simulation/gz/worlds`); repo worlds must be launched separately
-  first — PX4 then detects the running world via `gz topic -l` and only
-  starts the bridge (see `test_approach_camera.py`).
-- **Run tests on an idle machine.** A leftover `px4`/`gz sim` process halves
-  the CPU, collapses the real-time factor, and makes wall-clock thresholds
-  (displacement per 3 s, climb per 15 s) fail spuriously. The scripts pkill
-  stale sims on startup and kill their own sim in a `finally` block — keep
-  that guarantee when editing them.
-- Wall-clock test windows measure wall time while physics runs on sim time;
-  on a loaded machine expect proportionally less simulated motion.
+- logs/multi_trial_summary.json
+- logs/raw_trial_*.csv
+- logs/tracking_diagnostics_trial_*.jsonl
+
+Summary chia metrics thành perception, control và safety. Một scenario có thể safety PASS nhưng perception retention thấp; luôn đọc cả ba lớp.
+
+## Command latency
+
+~~~bash
+python3 scripts/command_latency_micro_test.py
+~~~
+
+Path đo:
+
+~~~text
+HUD publish
+  -> MotionArbiter callback
+  -> control decision
+  -> MAVLink send
+  -> simulated vehicle velocity change
+~~~
+
+Không dùng control-loop frequency để suy ra command latency.
+
+## Runtime checklist
+
+Trước mỗi live test:
+
+~~~bash
+pgrep -af "px4|gz sim|parameter_bridge|yolo_detector|motion_arbiter"
+~~~
+
+Trong test:
+
+~~~bash
+ros2 topic hz /camera/image_raw
+ros2 topic hz /tracking/error
+ros2 topic echo /tracking/control_health
+~~~
+
+Sau test, xác nhận process do test tạo đã dừng.
+
+## Test interpretation
+
+- Wall time và simulation time không giống nhau khi Gazebo RTF giảm.
+- Camera frame là dữ liệu perishable; backlog cũ không phải valid tracking evidence.
+- Offboard loss, watchdog stall và altitude drop là safety/control metrics.
+- Tracking retention, error và target loss là perception metrics.
+- Một PASS phải chỉ rõ metric/gate nào đã pass.
+
+## Các lưu ý PX4
+
+- Takeoff/arming cần GPS/EKF readiness phù hợp với airframe.
+- PX4 chỉ nhận Offboard ổn định khi setpoint được stream liên tục.
+- Project-local worlds nên được Gazebo server chạy trước; PX4 attach vào world đang tồn tại.
+- Chạy trên máy rảnh hoặc ghi CPU/RTF cùng kết quả vì contention ảnh hưởng wall-clock tests.
+- Không chỉnh PX4 source hoặc failsafe chỉ để làm test pass.

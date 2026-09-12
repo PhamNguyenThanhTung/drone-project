@@ -1,318 +1,226 @@
-# UAV Vision Tracking & Autonomous Follower
+# Autonomous Person Tracking Drone
 
-Hệ thống mô phỏng drone tự động phát hiện, khóa và bám theo người trong thời
-gian thực. Dự án kết hợp PX4 SITL, Gazebo Harmonic, ROS 2 Humble,
-YOLOv8/ByteTrack, MAVLink và một bộ điều khiển state machine có hỗ trợ thao tác
-thủ công từ Live Camera HUD.
+Hệ thống mô phỏng drone tự động phát hiện, khóa và bám theo người bằng **PX4 SITL, Gazebo Harmonic, ROS 2 Humble, YOLOv8n, ByteTrack và MAVLink**.
 
-> [!IMPORTANT]
-> Dự án hiện ở giai đoạn nghiên cứu và kiểm thử SITL. Kết quả regression gần
-> nhất đạt 3/5 kịch bản. Hệ thống chưa đủ điều kiện để triển khai bay thật nếu
-> chưa hoàn thành toàn bộ safety gates trong [PROJECT_REPORT.md](PROJECT_REPORT.md).
+> Phạm vi hiện tại là nghiên cứu và kiểm thử SITL. Chưa có xác nhận bay thật.
 
-## Mục lục
+## 1. Hệ thống làm gì?
 
-- [Tổng quan](#tổng-quan)
-- [Kiến trúc hệ thống](#kiến-trúc-hệ-thống)
-- [Cấu trúc repository](#cấu-trúc-repository)
-- [Yêu cầu môi trường](#yêu-cầu-môi-trường)
-- [Cài đặt](#cài-đặt)
-- [Khởi chạy](#khởi-chạy)
-- [Điều khiển Live HUD](#điều-khiển-live-hud)
-- [ROS 2 interfaces](#ros-2-interfaces)
-- [Kiểm thử và kết quả](#kiểm-thử-và-kết-quả)
-- [Xử lý sự cố](#xử-lý-sự-cố)
-- [An toàn và giới hạn](#an-toàn-và-giới-hạn)
-- [Tài liệu dự án](#tài-liệu-dự-án)
+~~~text
+Gazebo camera
+  -> /camera/image_raw
+  -> YOLOv8n: phát hiện person
+  -> ByteTrack: duy trì track ID
+  -> /tracking/error: sai số tâm và diện tích box
+  -> MotionArbiter: state machine + visual servo
+  -> MAVLink velocity setpoint
+  -> PX4 Offboard
+  -> X500 chuyển động
+  -> camera frame kế tiếp
+~~~
 
-## Tổng quan
+Operator có thể click chọn mục tiêu hoặc dùng bàn phím. Một lệnh W/A/S/D/Q/E/R/F đưa hệ thống vào MANUAL và có ưu tiên trước automatic target reacquisition.
 
-### Mục tiêu
+## 2. Thành phần
 
-- Phát hiện người bằng YOLOv8n và duy trì ID bằng ByteTrack.
-- Chuyển sai số ảnh thành lệnh vận tốc/yaw để drone bám mục tiêu.
-- Duy trì độ cao, khoảng cách và hướng nhìn trong các tình huống tiến gần,
-  đi xa, rẽ ngang hoặc quay đầu.
-- Cho phép người vận hành giành quyền điều khiển tức thời bằng bàn phím.
-- Cung cấp môi trường SITL lặp lại được để tái hiện luồng vận hành, lỗi và kiểm
-  tra failsafe trước khi làm việc với phần cứng thật.
+| Thành phần | Input | Output | Trách nhiệm |
+| --- | --- | --- | --- |
+| Gazebo Harmonic | World/model SDF | Camera, physics, actor pose | Mô phỏng môi trường và sensor |
+| ros_gz_bridge | Gazebo Transport | /camera/image_raw | Chuyển Image sang ROS 2 |
+| yolo_detector_node | sensor_msgs/Image | tracking error, debug image | YOLO, ByteTrack, target policy |
+| motion_arbiter_node | Error, teleop, target, telemetry | MAVLink, state, health | Visual servo và authority |
+| live_camera_hud_node | Debug image, state, GPS | Click, Twist, action, goto | Operator interface |
+| sim_realism_node | Sensor topics tùy chọn | Degraded topics | Delay/drop/blur/noise injection |
+| PX4 SITL | MAVLink setpoint | Telemetry, actuator response | Estimator, Offboard và failsafe |
 
-### Thành phần chính
+Package ROS 2 hiện tại nằm trong **ros2_ws/src/vision_tracking**. setup.py đăng ký bốn entry point: yolo_detector_node, motion_arbiter_node, live_camera_hud_node và sim_realism_node.
 
-| Thành phần | Vai trò |
-| --- | --- |
-| PX4 SITL | Flight controller, estimator, arming, takeoff, offboard và failsafe |
-| Gazebo Harmonic | Mô phỏng vật lý, camera, cảm biến, drone và người đi bộ |
-| ROS 2 Humble | Bus giao tiếp giữa camera, detector, HUD và bộ điều khiển |
-| YOLOv8n + ByteTrack | Phát hiện người và theo dõi target ID |
-| `motion_arbiter.py` | State machine và visual-servo flight control |
-| `live_camera_hud.py` | Video, bounding box, GPS/minimap và teleoperation |
-| QGroundControl | Giám sát PX4 qua MAVLink UDP 14550 trên Windows |
+## 3. Repository map
 
-## Kiến trúc hệ thống
-
-```mermaid
-flowchart LR
-    GZ[Gazebo camera and sensors] -->|Gazebo Transport| BR[ros_gz_bridge]
-    BR -->|/camera/image_raw| YOLO[YOLOv8 + ByteTrack]
-    REAL[Simulation realism node] -. optional delay/drop/noise .-> YOLO
-    YOLO -->|/tracking/error| ARB[MotionArbiter]
-    YOLO -->|/tracking/debug_image| HUD[Live Camera HUD]
-    HUD -->|target, teleop, takeoff, land, GPS goto| ARB
-    ARB -->|MAVLink offboard setpoints| PX4[PX4 SITL]
-    PX4 -->|vehicle telemetry| ARB
-    ARB -->|state and GPS| HUD
-    PX4 -->|UDP 14550| QGC[QGroundControl]
-```
-
-Luồng xử lý chính:
-
-1. Gazebo tạo ảnh camera `640x480` và dữ liệu cảm biến.
-2. `ros_gz_bridge` chuyển ảnh sang ROS 2 topic `/camera/image_raw`.
-3. YOLO phát hiện lớp `person`, ByteTrack duy trì ID và tính sai số tâm/diện
-   tích bounding box.
-4. `MotionArbiter` chuyển sai số ảnh thành vận tốc thân drone, yaw rate và
-   quyết định chuyển state.
-5. PX4 nhận stream setpoint Offboard và điều khiển mô hình `x500_flow`.
-6. HUD hiển thị video, trạng thái, GPS, FPS và nhận lệnh từ người vận hành.
-
-Trong kiến trúc triển khai thật, drone truyền video tới server từ xa để suy luận;
-server chỉ gửi `target_id` và trạng thái mục tiêu ở tần số thấp. Companion
-computer trên drone vẫn chạy vòng `MotionArbiter` 10 Hz, gửi setpoint tới PX4 và
-thực thi watchdog/failsafe cục bộ khi video hoặc liên kết server bị mất.
-
-## Cấu trúc repository
-
-```text
+~~~text
 drone-project/
-├── README.md                         # Hướng dẫn sử dụng nhanh
-├── PROJECT_REPORT.md                 # Báo cáo dự án đầy đủ
-├── start_stack.sh                    # Khởi chạy toàn bộ simulation stack
-├── motion_arbiter.py                 # Flight state machine/control
-├── live_camera_hud.py                # Live camera HUD và teleoperation
-├── requirements.txt                  # Python dependencies
-├── yolov8n.pt                        # YOLOv8 nano weights
-├── gazebo/
-│   ├── models/                       # x500 và pedestrian assets
-│   └── worlds/                       # Các kịch bản tracking
+├── start_stack.sh
+├── bao_cao_du_an_day_du.html
+├── README.md
+├── PROJECT_REPORT.md
 ├── ros2_ws/src/vision_tracking/
+│   ├── launch/tracking_stack.launch.py
+│   ├── config/*.yaml
 │   └── vision_tracking/
-│       ├── yolo_detector_node.py     # Detector/tracker ROS 2 node
-│       └── sim_realism_node.py       # Delay/drop/noise injection
-├── simulation/                       # Realism, vehicle profile, failure tools
-├── tests/px4/                        # SITL, MAVLink và regression tests
-├── logs/                             # CSV/JSON/JSONL kết quả thử nghiệm
-├── patches/                          # PX4 x500_flow GPS patch
-└── scripts/                          # Setup và patch automation
-```
+│       ├── yolo_detector_node.py
+│       ├── motion_arbiter_node.py
+│       ├── live_camera_hud_node.py
+│       └── sim_realism_node.py
+├── gazebo/models/
+├── gazebo/worlds/
+├── simulation/
+├── scripts/
+├── tests/px4/
+└── logs/
+~~~
 
-## Yêu cầu môi trường
+Các script motion_arbiter.py và live_camera_hud.py ở root là compatibility entry points còn được một số test legacy tham chiếu. Normal startup hiện tại dùng ROS 2 package nodes.
 
-- Ubuntu 22.04 native hoặc WSL2 trên Windows 10/11.
+## 4. Yêu cầu
+
+- Ubuntu 22.04 hoặc WSL2.
 - ROS 2 Humble Desktop.
-- Gazebo Harmonic (`gz-sim8`) và `ros-humble-ros-gz-bridge`.
-- Python 3.10 trở lên.
-- PX4-Autopilot v1.14 đến v1.16.2 tại `../PX4-Autopilot` hoặc đường dẫn được
-  chỉ định bởi `PX4_DIR`.
-- QGroundControl trên Windows nếu cần theo dõi telemetry/GCS.
+- Gazebo Harmonic và ros_gz_bridge.
+- Python 3.10+, pymavlink, ultralytics, torch, OpenCV và cv_bridge.
+- PX4-Autopilot checkout; đặt PX4_DIR nếu không nằm tại ../PX4-Autopilot.
+- Model yolov8n.pt.
+- CUDA tùy chọn. start_stack.sh mặc định kiểm tra và dùng cuda:0; đặt YOLO_DEVICE=cpu để chạy CPU.
 
-> Cấu hình CPU/GPU được dùng khi chạy local simulation chỉ là chi tiết của máy
-> đang chạy đồng thời PX4 SITL/Gazebo và YOLO, không phải thuộc tính của hệ thống
-> cuối cùng. Khi triển khai thật, drone truyền video tới companion/remote server
-> để suy luận; năng lực tính toán phía server là mối quan tâm tách biệt và nằm
-> ngoài phạm vi tài liệu này.
+## 5. Cài đặt
 
-## Cài đặt
-
-Clone dự án và chạy setup:
-
-```bash
-git clone https://github.com/PhamNguyenThanhTung/drone-project.git
-cd drone-project
+~~~bash
+cd ~/drone-project
 ./scripts/setup_environment.sh
-```
+~~~
 
-Script setup thực hiện:
+Hoặc:
 
-1. Kiểm tra ROS 2 Humble.
-2. Cài Python dependencies từ `requirements.txt`.
-3. Áp dụng patch GPS cho PX4 airframe `4021_gz_x500_flow`.
-4. Build package ROS 2 `vision_tracking` bằng `colcon`.
-5. Kiểm tra hoặc tải model `yolov8n.pt`.
-
-Thiết lập thủ công khi cần:
-
-```bash
+~~~bash
 source /opt/ros/humble/setup.bash
 pip3 install -r requirements.txt
-./scripts/apply_px4_patch.sh --apply /path/to/PX4-Autopilot
 cd ros2_ws
 colcon build --symlink-install --packages-select vision_tracking
 source install/setup.bash
-```
+~~~
 
-Thiết bị suy luận và các cờ môi trường của phiên SITL được mô tả trong
-`start_stack.sh`/tài liệu setup; chúng không đại diện cho kiến trúc triển khai
-cuối cùng.
+## 6. Khởi chạy
 
-## Khởi chạy
-
-### Chạy đầy đủ
-
-```bash
+~~~bash
+cd ~/drone-project
 ./start_stack.sh
-```
+~~~
 
-Mặc định hệ thống dùng:
+Script thực hiện:
 
-- World: `person_tracking_path`
-- Model: `x500_flow`
-- Takeoff altitude: `3.8 m`
-- HUD: bật
-- QGroundControl auto-launch: tắt
+1. Source ROS 2 và build workspace.
+2. Đặt Gazebo resource/plugin paths.
+3. Dọn process cũ thuộc stack.
+4. Start Gazebo và chờ /clock.
+5. Start PX4 SITL gz_x500_flow và chờ MAVLink.
+6. Start ROS 2 launch: bridge, realism tùy chọn, YOLO, MotionArbiter, HUD.
+7. Kiểm tra /camera/image_raw, /tracking/error và /tracking/control_health.
 
-Các tùy chọn world, realism, HUD và thiết bị chỉ là cờ của phiên mô phỏng; xem
-`start_stack.sh` hoặc tài liệu setup khi cần thay đổi, thay vì coi chúng là
-thành phần của luồng triển khai.
+Các mode:
 
-Nhấn `Ctrl-C` tại terminal chạy `start_stack.sh` để dừng toàn bộ process do
-script tạo.
+~~~bash
+HEADLESS=1 SHOW_HUD=0 ./start_stack.sh
+WORLD_NAME=person_tracking_no_trees ./start_stack.sh
+YOLO_DEVICE=cpu SHOW_HUD=0 ./start_stack.sh
+SIM_REALISM=1 ./start_stack.sh
+TAKEOFF_ALT=3.8 ./start_stack.sh
+~~~
 
-## Điều khiển Live HUD
+## 7. Workflow của một camera frame
 
-| Phím/thao tác | Chức năng | State kết quả |
-| --- | --- | --- |
-| `TAB` hoặc `T` | Arm và takeoff | `STANDBY` sau khi đạt độ cao |
-| `P` | Land | `STANDBY`/disarmed |
-| Click vào người | Khóa target từ bounding box | `TRACKING` |
-| `1` đến `9` | Khóa target ID | `TRACKING` |
-| `0` hoặc `SPACE` | Hủy target, hover | `STANDBY` |
-| `W` / `S` | Tiến / lùi | `MANUAL` |
-| `A` / `D` | Trái / phải | `MANUAL` |
-| `R` / `F` | Lên / xuống | `MANUAL` |
-| `Q` / `E` | Yaw trái / phải | `MANUAL` |
-| `X` | Dừng lệnh vận tốc | `MANUAL` |
-| Click minimap | Gửi GPS position setpoint | `MANUAL_GOTO` |
+### Camera
 
-## ROS 2 interfaces
+Model X500 khai báo camera 640 x 480, 30 Hz. ros_gz_bridge chuyển Gazebo Image sang sensor_msgs/Image trên /camera/image_raw.
 
-| Topic | Kiểu message | Producer | Consumer |
-| --- | --- | --- | --- |
-| `/camera/image_raw` | `sensor_msgs/Image` | Gazebo bridge | YOLO detector |
-| `/simulation/camera/image` | `sensor_msgs/Image` | Realism node | YOLO detector |
-| `/tracking/debug_image` | `sensor_msgs/Image` | YOLO detector | Live HUD |
-| `/tracking/error` | `geometry_msgs/Point` | YOLO detector | MotionArbiter |
-| `/tracking/select_target` | `std_msgs/Int32` | HUD/detector | Detector/arbiter |
-| `/tracking/click_point` | `geometry_msgs/Point` | HUD | Detector |
-| `/teleop/cmd_vel` | `geometry_msgs/Twist` | HUD | MotionArbiter |
-| `/teleop/flight_action` | `std_msgs/String` | HUD | MotionArbiter |
-| `/tracking/goto_gps` | `geometry_msgs/Point` | HUD | MotionArbiter |
-| `/tracking/motion_state` | `std_msgs/String` | MotionArbiter | HUD |
-| `/tracking/gps` | `sensor_msgs/NavSatFix` | MotionArbiter | HUD |
-| `/tracking/control_health` | `std_msgs/String` | MotionArbiter | GCS/Monitor |
+### YOLO và ByteTrack
 
-## Kiểm thử và kết quả
+yolo_detector_node.py:
 
-### Regression 5 kịch bản
+1. Nhận frame với QoS KEEP_LAST depth 1 và BEST_EFFORT.
+2. Chuyển sang BGR bằng cv_bridge.
+3. Gọi YOLO.track với persist và ByteTrack.
+4. Chỉ giữ COCO class 0, confidence mặc định 0.45, IoU 0.45.
+5. Lọc area/aspect ratio cho auto selection.
+6. Giữ target hiện tại hoặc re-acquire bằng IoU/proximity nếu track ID thay đổi.
+7. Làm mượt box bằng EMA.
+8. Publish geometry_msgs/Point.
 
-```bash
-# Chạy đầy đủ SITL 5 kịch bản
-python3 tests/px4/run_isolated_multi_trial.py
+### Error contract
 
-# Hoặc phân tích lại telemetry CSV hiện có với schema Stage 1 (không cần bật simulation)
-python3 tests/px4/run_isolated_multi_trial.py --analyze-only
-```
+Giá trị được scale về không gian 416 x 416:
 
-Kết quả được lưu dưới dạng relative paths và run metadata trong `logs/multi_trial_summary.json`, phân tách 3 lớp chỉ số (Perception, Control, Safety):
+~~~text
+Point.x = target_center_x - 208
+Point.y = target_center_y - 208
+Point.z = bbox_width * bbox_height
+~~~
 
-| Trial | Kịch bản | Alt Drop | Control | Track % | Perception | Safety | Status |
-| ---: | --- | ---: | --- | ---: | --- | --- | --- |
-| 1 | Nominal 180-degree turn | `0.085 m` | PASS | `10.6%` | FAIL | PASS | PASS |
-| 2 | Fast 180-degree turn | `0.000 m` | PASS | `12.3%` | FAIL | PASS | PASS |
-| 3 | Lateral left turn | `0.255 m` | FAIL | `24.3%` | WARN | PASS | FAIL |
-| 4 | Lateral right turn | `0.000 m` | PASS | `32.1%` | WARN | PASS | PASS |
-| 5 | Aggressive close-in | `0.187 m` | FAIL | `33.3%` | WARN | PASS | FAIL |
+x/y là pixel error. z là area proxy cho khoảng cách, không phải depth.
 
-Kết luận: tầng Safety đạt độ tin cậy tuyệt đối (100% PASS, 0 lần rớt offboard/stall); tầng Control đạt 3/5 kịch bản; tầng Perception còn tracking retention thấp (`10.6%` - `33.3%`), là trọng tâm cần tối ưu trong Giai đoạn 2. Không được dùng bảng PASS như bằng chứng hệ thống đã sẵn sàng bay thật.
+### MotionArbiter
 
-### Các test quan trọng khác
+Mỗi 0.10 s, timer steady-clock:
 
-```bash
-# Baseline arm/takeoff/offboard/land
-python3 tests/px4/px4_baseline_test.py
+1. Cập nhật PX4 telemetry.
+2. Đọc state, vision freshness, error, area và teleop.
+3. Chọn STANDBY, TRACKING, MANUAL hoặc MANUAL_GOTO.
+4. Tính vx, vy, vz và yaw_rate.
+5. Gửi một MAVLink setpoint nếu vehicle armed và airborne.
 
-# Kiểm tra camera -> YOLO -> /tracking/error
-python3 tests/px4/test_approach_camera.py
+Trong TRACKING, controller có các substate: SAFE_ZONE_HOVER, ADVANCING, ADVANCING_CLOSE_IN, BACKING_SMOOTH, BACKING_UP_TO_RECOVER, ADVANCING_TO_TURN_POINT, RECOVERING_YAW_HEADING và SEARCHING_HOLD.
 
-# Kiểm tra quay đầu và ghi telemetry
-python3 tests/px4/test_person_turnaround_live.py
+## 8. Operator controls
 
-# Kiểm tra đường dài nhiều góc rẽ
-python3 tests/px4/test_long_path_tracking.py
+| Input | Hành động |
+| --- | --- |
+| TAB hoặc T | Arm và takeoff |
+| P | Land |
+| Click box hoặc 1-9 | Lock target |
+| 0 hoặc Space | Clear target, STANDBY |
+| W/S | Tiến/lùi |
+| A/D | Trái/phải |
+| R/F | Lên/xuống |
+| Q/E | Yaw trái/phải |
+| X | Stop velocity |
+| Click minimap | MANUAL_GOTO |
 
-# Tái hiện offboard-loss/autoland/takeoff recovery
-python3 test_repro_autoland_and_takeoff.py
-```
+Teleop publish geometry_msgs/Twist lên /teleop/cmd_vel. Non-zero command tạo MANUAL authority; sau teleop_timeout 0.5 s, arbiter về STANDBY.
 
-Đọc thêm hướng dẫn test tại [tests/px4/README.md](tests/px4/README.md).
+## 9. Kiểm tra nhanh
 
-## Xử lý sự cố
-
-### HUD FPS thấp
-
-FPS trên HUD là tốc độ ảnh đã đi qua camera, Gazebo, bridge, YOLO, debug render
-và ROS 2; nó không chỉ là tốc độ inference. Kiểm tra từng đoạn:
-
-```bash
+~~~bash
+ros2 topic list
 ros2 topic hz /camera/image_raw
-ros2 topic hz /tracking/debug_image
-tail -f /tmp/yolo.log
-```
+ros2 topic hz /tracking/error
+ros2 topic echo /tracking/motion_state
+ros2 topic echo /tracking/control_health
+pgrep -af "px4|gz sim|parameter_bridge|yolo_detector|motion_arbiter"
+~~~
 
-Trong log YOLO, `mean_latency=0.033s` tương đương xấp xỉ 30 inference/s.
-`det_rate` là tỷ lệ frame phát hiện được người, không phải FPS.
+Log chính:
 
-### Hai trial regression thất bại
+- /tmp/gz_sim.log
+- /tmp/px4_sim.log
+- /tmp/ros_tracking_stack.log
+- logs/tracking_diagnostics.jsonl
+- logs/scheduler_trace*.jsonl
+- logs/command_latency_trace*.jsonl
 
-Hai lần FAIL chủ yếu bắt nguồn từ logic trong `motion_arbiter.py`, không phải
-hiệu năng suy luận: `vz` bị hard-code `0.0` nên không có phản hồi độ cao, phép
-tính khoảng cách pinhole dùng hằng số độ cao lúc takeoff, còn các nhánh
-`BACKING_UP_VISIBLE` và `BACKING_UP_TO_RECOVER` khóa `yaw_rate`/`vy` hoặc lùi mù
-trong vài giây khi target mất hay rơi xuống nửa dưới khung hình. Camera bị rung,
-IoU YOLO giảm về 0 và track bị mất vĩnh viễn. CUDA/WSL chỉ là một caveat môi
-trường phụ cần ghi nhận khi tái hiện.
+## 10. Test và evidence
 
-### Simulation chậm hoặc test thất bại ngẫu nhiên
+~~~bash
+python3 tests/px4/run_isolated_multi_trial.py
+python3 tests/px4/run_isolated_multi_trial.py --analyze-only
+python3 scripts/command_latency_micro_test.py
+~~~
 
-- Dừng các instance `px4`, `gz sim`, detector hoặc HUD còn sót.
-- Chạy test trên máy ít tải; wall-clock và simulation time có thể lệch khi CPU
-  bị bão hòa.
-- Khi cần cô lập control khỏi GUI, dùng chế độ headless được mô tả trong
-  `start_stack.sh`.
+Snapshot hiện tại:
 
-### QGroundControl không kết nối
+- Control period: 0.100 s.
+- Max control gap sau steady-clock fix: khoảng 0.113 s.
+- Offboard loss: 0.
+- Watchdog stall: 0.
+- Năm scenario SITL hoàn thành safety/control gate: 5/5.
+- Command P50: 137.6 ms; P95: 515.8 ms.
 
-- Chạy QGC trực tiếp trên Windows.
-- Kiểm tra UDP 14550 và `PX4_GCS_IP`.
-- Đọc `/tmp/px4_gcs_mavlink.log` và `/tmp/px4_sim.log`.
+Các con số là bằng chứng SITL, không phải guarantee cho real hardware.
 
-## An toàn và giới hạn
+## 11. Safety và giới hạn
 
-> [!WARNING]
-> Không dùng trực tiếp cấu hình SITL để bay ngoài trời. Không thử nghiệm với
-> cánh quạt gắn trên drone nếu chưa hoàn thành HIL, bench test tháo cánh, dây
-> neo/lồng bảo vệ, RC kill switch và geofence.
+Không tăng timeout để che stale data hoặc tuning PID trước khi xác nhận đúng layer lỗi. Hệ thống chưa có depth/3D localization, camera calibration cho hardware, collision avoidance hoàn chỉnh, HIL hoặc real-flight validation.
 
-Các tham số như `COM_OF_LOSS_T`, `NAV_DLL_ACT`, `NAV_RCL_ACT`, tốc độ tiến/lùi
-và vehicle dynamics phải được đo và cấu hình lại cho airframe thật. File
-`simulation/vehicle_profile.yaml` vẫn chứa các trường `null` cần dữ liệu đo
-thực tế.
+Đọc thêm:
 
-## Tài liệu dự án
-
-- [PROJECT_REPORT.md](PROJECT_REPORT.md): báo cáo đầy đủ để review/presentation.
-- [simulation/README.md](simulation/README.md): realism, failure injection và
-  safety ladder.
-- [tests/px4/README.md](tests/px4/README.md): hướng dẫn test PX4/MAVLink.
-- [logs/multi_trial_summary.json](logs/multi_trial_summary.json): kết quả
-  regression gần nhất.
+- [Báo cáo HTML](bao_cao_du_an_day_du.html)
+- [Tài liệu kỹ thuật](PROJECT_REPORT.md)
+- [Simulation realism](simulation/README.md)
+- [PX4 tests](tests/px4/README.md)

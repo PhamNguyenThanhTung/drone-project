@@ -16,7 +16,7 @@ import torch
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
@@ -118,6 +118,8 @@ class YoloDetectorNode(Node):
             Int32, '/tracking/select_target', self.on_select_target, 10)
         self.sub_click = self.create_subscription(
             Point, '/tracking/click_point', self.on_click_point, 10)
+        self.sub_motion_state = self.create_subscription(
+            String, '/tracking/motion_state', self.on_motion_state, 10)
 
         # Camera data is perishable.  A reliable queue can make inference
         # process old frames after a brief GPU/ROS scheduling stall, producing
@@ -132,6 +134,7 @@ class YoloDetectorNode(Node):
         self.state = STATE_LOST
         self.target_id = None
         self.manual_target_id = None
+        self.arbiter_motion_state = None
         self.last_seen = 0.0
         self.logged_source_size = None
         self.current_cands = []
@@ -373,12 +376,22 @@ class YoloDetectorNode(Node):
 
         return cands
 
+    def on_motion_state(self, msg: String):
+        try:
+            self.arbiter_motion_state = msg.data.split(':')[0].strip()
+        except Exception:
+            pass
+
     def select_target(self, cands):
         if not cands:
             return None
 
         if self.manual_target_id == -1:
             # Standby mode: do not auto-track
+            return None
+
+        if getattr(self, 'arbiter_motion_state', None) == 'MANUAL':
+            # Pilot has manual control; suppress automatic tracking re-acquisition
             return None
 
         if self.manual_target_id is not None and self.manual_target_id >= 0:
@@ -462,14 +475,27 @@ class YoloDetectorNode(Node):
         self.get_logger().info(
             '[YOLO] lock re-acquired: track id %s -> %s (IoU %.2f, Hybrid %.2f)'
             % (old_id, self.manual_target_id, best_iou, best_score))
-        # Keep the arbiter and the HUD banner on the same id.
-        out = Int32()
-        out.data = int(self.manual_target_id)
-        self.pub_select.publish(out)
+        # Keep the arbiter and the HUD banner on the same id, unless arbiter is in manual mode
+        if getattr(self, 'arbiter_motion_state', None) != 'MANUAL':
+            out = Int32()
+            out.data = int(self.manual_target_id)
+            self.pub_select.publish(out)
         return best
 
     # ------------------------------------------------------------------
     def publish_error(self, target):
+        """Publish tracking error Point(x, y, z) in normalized 416x416 coordinate space.
+
+        Contract Specification (Option B - Area Contract):
+        - msg.x: horizontal pixel error relative to 416x416 frame center (208.0)
+        - msg.y: vertical pixel error relative to 416x416 frame center (208.0)
+        - msg.z: bounding box area in 416x416 coordinate space (width * height).
+                 Native camera resolution is 640x480. Published area scales as:
+                 A_pub = (w_native * 416/640) * (h_native * 416/480) ≈ 0.5633 * A_native.
+                 This matches MotionArbiter's calibrated target_area_min=6000.0 and
+                 target_area_max=13000.0 (3.47% to 7.51% of 416x416 frame), maintaining
+                 the calibrated ~4.5m follow distance without breaking threshold stability.
+        """
         _tid, x1, y1, x2, y2, _cf = target
         x1, x2 = x1 * self.sx, x2 * self.sx
         y1, y2 = y1 * self.sy, y2 * self.sy

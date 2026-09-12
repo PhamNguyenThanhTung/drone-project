@@ -1,0 +1,7 @@
+live_camera_hud:
+  ros__parameters:
+    topic: "/tracking/debug_image"
+    teleop_speed: 2.0
+    teleop_z_speed: 1.0
+    teleop_yaw_speed: 1.10
+    map_radius_m: 25.0

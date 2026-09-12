@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'vision_tracking'
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +30,8 @@ setup(
         'console_scripts': [
             'yolo_detector_node = vision_tracking.yolo_detector_node:main',
             'sim_realism_node = vision_tracking.sim_realism_node:main',
+            'motion_arbiter_node = vision_tracking.motion_arbiter_node:main',
+            'live_camera_hud_node = vision_tracking.live_camera_hud_node:main',
         ],
     },
 )

@@ -1,0 +1,22 @@
+simulation_realism:
+  ros__parameters:
+    camera_input: "/camera/image_raw"
+    camera_output: "/simulation/camera/image"
+    camera_delay_ms: 0.0
+    camera_drop_probability: 0.0
+    camera_motion_blur_pixels: 0
+    camera_queue_depth: 8
+    imu_input: ""
+    imu_output: "/simulation/imu"
+    imu_noise_stddev: 0.0
+    imu_bias: [0.0, 0.0, 0.0]
+    imu_drift_per_s: [0.0, 0.0, 0.0]
+    gps_input: ""
+    gps_output: "/simulation/gps"
+    gps_noise_m: 0.0
+    gps_dropout_probability: 0.0
+    baro_input: ""
+    baro_output: "/simulation/baro"
+    baro_noise_pa: 0.0
+    sensor_dropout_probability: 0.0
+    seed: 7
