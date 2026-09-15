@@ -10,6 +10,7 @@ Pipeline:
     -> Render Clean Live HUD -> /tracking/debug_image
 """
 
+import json
 import time
 import cv2
 import torch
@@ -22,7 +23,29 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
-STATE_TRACKING = 'TRACKING'
+try:
+    from vision_tracking.target_identity import (
+        TargetStateManager,
+        TargetHandle,
+        STATE_NO_TARGET,
+        STATE_TARGET_SELECTED,
+        STATE_TARGET_LOCKED,
+        STATE_TRACKING,
+        STATE_UNCERTAIN,
+        STATE_TARGET_LOST,
+    )
+except ImportError:
+    from target_identity import (
+        TargetStateManager,
+        TargetHandle,
+        STATE_NO_TARGET,
+        STATE_TARGET_SELECTED,
+        STATE_TARGET_LOCKED,
+        STATE_TRACKING,
+        STATE_UNCERTAIN,
+        STATE_TARGET_LOST,
+    )
+
 STATE_LOST = 'LOST'
 
 
@@ -67,6 +90,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('reacquire_min_iou', 0.15)
         self.declare_parameter('log_period', 1.5)
         self.declare_parameter('max_frame_rate', 0.0)
+        self.declare_parameter('auto_track', False)
 
         gp = self.get_parameter
         self.image_topic = gp('image_topic').value
@@ -101,6 +125,7 @@ class YoloDetectorNode(Node):
         self.reacquire_min_iou = float(gp('reacquire_min_iou').value)
         self.log_period = float(gp('log_period').value)
         self.max_frame_rate = float(gp('max_frame_rate').value)
+        self.auto_track = bool(gp('auto_track').value)
         self.last_inference_monotonic = 0.0
 
         self.bridge = CvBridge()
@@ -110,9 +135,16 @@ class YoloDetectorNode(Node):
 
         self.pub_error = self.create_publisher(Point, gp('error_topic').value, 10)
         self.pub_select = self.create_publisher(Int32, '/tracking/select_target', 10)
+        self.pub_target_handle = self.create_publisher(String, '/tracking/target_handle', 10)
         self.pub_debug = None
         if self.show_debug_image:
-            self.pub_debug = self.create_publisher(Image, gp('debug_image_topic').value, 2)
+            debug_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.pub_debug = self.create_publisher(
+                Image, gp('debug_image_topic').value, debug_qos)
 
         self.sub_select = self.create_subscription(
             Int32, '/tracking/select_target', self.on_select_target, 10)
@@ -120,6 +152,17 @@ class YoloDetectorNode(Node):
             Point, '/tracking/click_point', self.on_click_point, 10)
         self.sub_motion_state = self.create_subscription(
             String, '/tracking/motion_state', self.on_motion_state, 10)
+
+        # Target State Manager: owns logical target identity and fail-closed reacquisition
+        self.target_manager = TargetStateManager(
+            auto_track=self.auto_track,
+            reacquire_timeout_s=self.lock_reacquire_s if self.lock_reacquire_s <= 4.0 else 3.5,
+            target_lost_timeout_s=self.target_timeout,
+            reacquire_min_iou=self.reacquire_min_iou,
+            alpha_smooth=0.60,
+            max_implied_speed_px_s=450.0,
+            separation_margin=0.20
+        )
 
         # Camera data is perishable.  A reliable queue can make inference
         # process old frames after a brief GPU/ROS scheduling stall, producing
@@ -131,7 +174,7 @@ class YoloDetectorNode(Node):
         self.create_subscription(Image, self.image_topic, self.on_image, qos)
 
         # target state
-        self.state = STATE_LOST
+        self.state = STATE_NO_TARGET
         self.target_id = None
         self.manual_target_id = None
         self.arbiter_motion_state = None
@@ -220,48 +263,63 @@ class YoloDetectorNode(Node):
         cands = self.extract_candidates(results, infer)
         self.current_cands = cands
 
-        # 2. Select target person (Auto-lock single person or user manual selection)
-        target = self.select_target(cands)
-        now = time.time()
+        # 2. Target State Manager update (Fail-closed governance)
+        now_t = time.time()
+        is_manual = (getattr(self, 'arbiter_motion_state', None) == 'MANUAL')
 
-        if target is not None:
+        if self.manual_target_id == -1:
+            matched_cand = None
+            current_state = STATE_NO_TARGET
+        else:
+            matched_cand, current_state = self.target_manager.update(
+                cands=cands,
+                all_persons=self.all_persons,
+                now=now_t,
+                is_manual_flight=is_manual
+            )
+
+        self.state = current_state
+        handle = self.target_manager.target_handle
+
+        if matched_cand is not None and handle is not None and handle.is_tracking():
             self.n_detected += 1
-            self.last_seen = now
-            tid, x1, y1, x2, y2, cf, area = target
+            self.last_seen = now_t
 
-            # Apply EMA smoothing on bounding box
-            if self.smooth_box is not None and self.target_id == tid:
-                alpha = 0.60
-                sx1 = alpha * x1 + (1.0 - alpha) * self.smooth_box[0]
-                sy1 = alpha * y1 + (1.0 - alpha) * self.smooth_box[1]
-                sx2 = alpha * x2 + (1.0 - alpha) * self.smooth_box[2]
-                sy2 = alpha * y2 + (1.0 - alpha) * self.smooth_box[3]
-                self.smooth_box = (sx1, sy1, sx2, sy2)
-            else:
-                self.smooth_box = (x1, y1, x2, y2)
-                if self.target_id is not None and self.target_id != tid:
-                    self.n_track_switch += 1
+            # Check if tracker track_id was remapped under the same logical handle
+            if handle.current_track_id != self.manual_target_id and handle.current_track_id is not None:
+                old_tid = self.manual_target_id
+                self.manual_target_id = handle.current_track_id
+                self.n_id_remaps += 1
+                self.get_logger().info(
+                    f'[YOLO] Target {handle.handle_id} track remapped: {old_tid} -> {self.manual_target_id}'
+                )
+                if not is_manual:
+                    out = Int32()
+                    out.data = int(self.manual_target_id)
+                    self.pub_select.publish(out)
 
-            self.target_id = tid
-            if self.state != STATE_TRACKING:
-                self.get_logger().info('state LOST -> TRACKING (target_id=%s)' % self.target_id)
-            self.state = STATE_TRACKING
-
-            target_tuple = (self.target_id, self.smooth_box[0], self.smooth_box[1],
-                            self.smooth_box[2], self.smooth_box[3], cf)
+            self.target_id = handle.current_track_id
+            self.smooth_box = handle.smoothed_bbox
+            target_tuple = (
+                self.target_id,
+                self.smooth_box[0],
+                self.smooth_box[1],
+                self.smooth_box[2],
+                self.smooth_box[3],
+                handle.last_confidence
+            )
             self.publish_error(target_tuple)
         else:
-            if self.state == STATE_TRACKING and (now - self.last_seen) > self.target_timeout:
-                self.get_logger().warn(
-                    'target lost for %.2fs -> LOST (was target_id=%s)'
-                    % (now - self.last_seen, self.target_id))
-                self.state = STATE_LOST
-                self.target_id = None
+            # Target not actively tracking: FAIL-CLOSED (do NOT publish tracking error)
+            self.target_id = handle.current_track_id if handle is not None else None
+            if current_state == STATE_TARGET_LOST:
                 self.smooth_box = None
                 self.n_lost_events += 1
 
+        self.publish_target_handle_telemetry()
+
         if self.pub_debug is not None:
-            self.publish_debug(infer, target)
+            self.publish_debug(infer, matched_cand)
 
         self.log_metrics()
 
@@ -269,22 +327,39 @@ class YoloDetectorNode(Node):
         req_id = int(msg.data)
         if req_id < 0:
             self.get_logger().info('[YOLO] Target selection CLEARED -> Standby')
+            self.target_manager.clear_target(reason='operator_clear')
             self.manual_target_id = -1
             self.target_id = None
             self.smooth_box = None
             self.lock_lost_since = None
-            self.state = STATE_LOST
-        elif req_id == self.manual_target_id:
-            # Echo of our own re-acquire publish; keep the existing lock state.
+            self.state = STATE_NO_TARGET
+            self.publish_target_handle_telemetry()
+        elif (self.target_manager.target_handle is not None
+              and req_id == self.target_manager.target_handle.current_track_id):
+            # Echo of our own re-acquire publish or already active track; keep existing lock state.
             return
         else:
             self.get_logger().info(f'[YOLO] Target LOCKED to Person ID: {req_id}')
+            cand_bbox = None
+            cand_conf = 1.0
+            pool = self.all_persons or self.current_cands
+            for c in pool:
+                if c[0] == req_id:
+                    cand_bbox = c[1:5]
+                    cand_conf = float(c[5])
+                    break
+            handle = self.target_manager.select_target(
+                track_id=req_id,
+                bbox=cand_bbox,
+                conf=cand_conf,
+                lock_mode='MANUAL'
+            )
             self.manual_target_id = req_id
             self.target_id = req_id
             self.lock_lost_since = None
-            # Drop the old EMA anchor: keeping it blended the previous
-            # person's box into the newly selected one for several frames.
-            self.smooth_box = None
+            self.smooth_box = cand_bbox
+            self.state = handle.state if handle else STATE_NO_TARGET
+            self.publish_target_handle_telemetry()
 
     def on_click_point(self, msg):
         """Resolve a HUD pixel click against every detected person."""
@@ -383,36 +458,11 @@ class YoloDetectorNode(Node):
             pass
 
     def select_target(self, cands):
+        """Deprecated compatibility bridge delegating to target_manager."""
         if not cands:
             return None
-
-        if self.manual_target_id == -1:
-            # Standby mode: do not auto-track
-            return None
-
-        if getattr(self, 'arbiter_motion_state', None) == 'MANUAL':
-            # Pilot has manual control; suppress automatic tracking re-acquisition
-            return None
-
-        if self.manual_target_id is not None and self.manual_target_id >= 0:
-            matched = [c for c in cands if c[0] == self.manual_target_id]
-            if matched:
-                self.lock_lost_since = None
-                return matched[0]
-            # The locked id vanished. Before giving up, check whether one of
-            # the current boxes is plainly the same person under a new
-            # ByteTrack id (overlapping the last known box).
-            return self._reacquire_lock(cands)
-
-        # Auto-track mode. Stay on the person already being tracked as long as
-        # they are still detected: picking max(area*conf) every frame made the
-        # target id flip between people (and between frames) whenever their box
-        # sizes were close, which the HUD showed as a constantly changing ID.
-        if self.target_id is not None:
-            same = [c for c in cands if c[0] == self.target_id]
-            if same:
-                return same[0]
-        return max(cands, key=lambda c: c[6] * c[5])
+        cand, _state = self.target_manager.update(cands, self.all_persons)
+        return cand
 
     @staticmethod
     def _iou(box_a, box_b):
@@ -429,58 +479,26 @@ class YoloDetectorNode(Node):
         union = area_a + area_b - inter
         return inter / union if union > 0.0 else 0.0
 
-    def _reacquire_lock(self, cands):
-        """Re-bind a manual lock to the same person after a track-id switch using Hybrid IoU & Centroid Proximity."""
-        if self.smooth_box is None:
-            return None
-        now = time.time()
-        if self.lock_lost_since is None:
-            self.lock_lost_since = now
-        if now - self.lock_lost_since > self.lock_reacquire_s:
-            return None
-
-        ref_x1, ref_y1, ref_x2, ref_y2 = self.smooth_box
-        ref_cx, ref_cy = (ref_x1 + ref_x2) / 2.0, (ref_y1 + ref_y2) / 2.0
-        ref_w = max(1.0, ref_x2 - ref_x1)
-        ref_h = max(1.0, ref_y2 - ref_y1)
-
-        best, best_score, best_iou = None, -1.0, 0.0
-        for cand in cands:
-            iou = self._iou(self.smooth_box, cand[1:5])
-            c_x1, c_y1, c_x2, c_y2 = cand[1:5]
-            c_cx, c_cy = (c_x1 + c_x2) / 2.0, (c_y1 + c_y2) / 2.0
-
-            # Normalized Euclidean distance relative to box dimensions
-            dist_x = abs(c_cx - ref_cx) / max(ref_w, 30.0)
-            dist_y = abs(c_cy - ref_cy) / max(ref_h, 30.0)
-            dist_norm = (dist_x ** 2 + dist_y ** 2) ** 0.5
-
-            proximity_score = max(0.0, 1.0 - dist_norm / 2.0)
-            hybrid_score = 0.60 * iou + 0.40 * proximity_score
-
-            # Accept if standard IoU is met OR spatial proximity is very close despite camera shift
-            is_valid = (iou >= self.reacquire_min_iou) or (dist_norm < 1.2 and proximity_score >= 0.45)
-            if is_valid and hybrid_score > best_score:
-                best = cand
-                best_score = hybrid_score
-                best_iou = iou
-
-        if best is None:
-            return None
-
-        old_id = self.manual_target_id
-        self.manual_target_id = int(best[0])
-        self.lock_lost_since = None
-        self.n_id_remaps += 1
-        self.get_logger().info(
-            '[YOLO] lock re-acquired: track id %s -> %s (IoU %.2f, Hybrid %.2f)'
-            % (old_id, self.manual_target_id, best_iou, best_score))
-        # Keep the arbiter and the HUD banner on the same id, unless arbiter is in manual mode
-        if getattr(self, 'arbiter_motion_state', None) != 'MANUAL':
-            out = Int32()
-            out.data = int(self.manual_target_id)
-            self.pub_select.publish(out)
-        return best
+    def publish_target_handle_telemetry(self):
+        """Publish logical target handle state JSON to /tracking/target_handle."""
+        if self.pub_target_handle is None:
+            return
+        handle = self.target_manager.target_handle
+        if handle is not None:
+            data = handle.to_dict()
+        else:
+            data = {
+                'handle_id': None,
+                'state': STATE_NO_TARGET,
+                'current_track_id': None,
+                'previous_track_ids': [],
+                'lock_mode': 'MANUAL',
+                'last_seen': 0.0,
+                'confidence': 0.0,
+            }
+        msg = String()
+        msg.data = json.dumps(data)
+        self.pub_target_handle.publish(msg)
 
     # ------------------------------------------------------------------
     def publish_error(self, target):
@@ -555,10 +573,14 @@ class YoloDetectorNode(Node):
             # out a fresh number every few frames at CPU rates, so a numeric
             # label read as "tracking keeps jumping between people and then
             # losing them". The id stays internal only.
-            lock_mark = ' [LOCK]' if (
-                is_target and self.manual_target_id is not None
-                and self.manual_target_id >= 0) else ''
-            label = "PERSON%s" % (lock_mark if is_target else '')
+            handle = self.target_manager.target_handle
+            if is_target and handle is not None:
+                lock_mark = f" [{handle.handle_id} LOCK]"
+            elif is_target:
+                lock_mark = " [LOCK]"
+            else:
+                lock_mark = ""
+            label = "PERSON%s" % lock_mark
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
             label_y = max(th + 4, y1)
             cv2.rectangle(img, (x1, label_y - th - 4), (x1 + tw + 6, label_y + 2), color, -1)
@@ -566,15 +588,24 @@ class YoloDetectorNode(Node):
                 img, label, (x1 + 3, label_y - 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Tracking status text. Same rule as the box labels: no track id on
-        # screen, the number churns with every ByteTrack re-assignment.
+        # Tracking status banner with logical target handle
+        handle = self.target_manager.target_handle
         if self.state == STATE_TRACKING:
-
-            lock_kind = 'LOCK' if (
-                self.manual_target_id is not None
-                and self.manual_target_id >= 0) else 'AUTO'
-            status_text = 'TRACKING PERSON [%s]' % lock_kind
+            lock_label = handle.handle_id if (handle and handle.lock_mode == 'MANUAL') else 'AUTO'
+            status_text = f"TRACKING [{lock_label}]"
             badge_color = (0, 200, 0)
+        elif self.state == STATE_UNCERTAIN:
+            handle_str = f" [{handle.handle_id}]" if handle else ""
+            status_text = f"TARGET UNCERTAIN{handle_str} - HOLDING"
+            badge_color = (0, 165, 255)
+        elif self.state == STATE_TARGET_LOST:
+            handle_str = f" [{handle.handle_id}]" if handle else ""
+            status_text = f"TARGET LOST{handle_str}"
+            badge_color = (0, 0, 255)
+        elif self.state in (STATE_TARGET_SELECTED, STATE_TARGET_LOCKED):
+            handle_str = f" [{handle.handle_id}]" if handle else ""
+            status_text = f"TARGET LOCKED{handle_str}"
+            badge_color = (255, 255, 0)
         elif self.current_cands or self.all_persons:
             status_text = "CLICK A PERSON TO LOCK"
             badge_color = (0, 200, 255)
@@ -600,10 +631,12 @@ class YoloDetectorNode(Node):
             return
         self.last_log = now
         rate = 100.0 * self.n_detected / self.n_frames if self.n_frames else 0.0
+        handle = self.target_manager.target_handle
+        handle_id = handle.handle_id if handle else 'NONE'
         self.get_logger().info(
-            'state=%s target_id=%s det_rate=%.1f%% mean_latency=%.3fs '
+            'state=%s handle=%s target_id=%s det_rate=%.1f%% mean_latency=%.3fs '
             'switches=%d id_remaps=%d lost_events=%d'
-            % (self.state, self.target_id, rate,
+            % (self.state, handle_id, self.target_id, rate,
                self.sum_latency / max(1, self.n_frames),
                self.n_track_switch, self.n_id_remaps, self.n_lost_events))
 

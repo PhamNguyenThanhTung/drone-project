@@ -33,6 +33,16 @@ from geometry_msgs.msg import Point, Twist
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Int32, String
 from pymavlink import mavutil
+from dataclasses import asdict
+
+try:
+    from vision_tracking.pinhole_geometry import (
+        PinholeCameraConfig, TargetGeometry, estimate_pinhole_geometry
+    )
+except ImportError:
+    from pinhole_geometry import (
+        PinholeCameraConfig, TargetGeometry, estimate_pinhole_geometry
+    )
 
 # State definitions
 STATE_MANUAL = 'MANUAL'
@@ -101,28 +111,49 @@ class MotionArbiter(Node):
         # servoing.  Keeping the old 1.2 s hold made the vehicle act on stale
         # pixel errors while the target had already moved or disappeared.
         self.declare_parameter('vision_fresh_timeout', 0.40)
-        self.declare_parameter('enable_forward', True)
-        self.declare_parameter('default_walk_speed', 1.15)
-        self.declare_parameter('default_backup_speed', 1.10)
+        # 3D Pinhole Distance Estimation & Camera Geometry Parameters (cb6b1ae port)
+        self.declare_parameter('camera_pitch_rad', 0.65)
+        self.declare_parameter('fx', 133.55)
+        self.declare_parameter('fy', 178.07)
+        self.declare_parameter('cx', 208.0)
+        self.declare_parameter('cy', 208.0)
+        self.declare_parameter('person_height_m', 0.90)
+        self.declare_parameter('min_relative_height_m', 1.50)
+        self.declare_parameter('target_distance_m', 4.50)
+        self.declare_parameter('tree_clearance_margin_m', 1.80)
+        self.declare_parameter('tree_clearance_margin', 1.80)
+
+        # Speed & Deadband Parameters (Restored cb6b1ae defaults)
+        self.declare_parameter('base_forward_speed_mps', 0.85)
+        self.declare_parameter('default_walk_speed', 0.85)
+        self.declare_parameter('backward_speed_mps', 0.75)
+        self.declare_parameter('default_backup_speed', 0.75)
+        self.declare_parameter('deadband_x_px', 20.0)
+        self.declare_parameter('deadband_x', 20.0)
+        self.declare_parameter('deadband_y_px', 25.0)
+        self.declare_parameter('deadband_y', 25.0)
+        self.declare_parameter('max_forward_speed', 1.80)
+        self.declare_parameter('min_forward_speed', -1.20)
+        self.declare_parameter('turn_point_speed_mps', 1.35)
+        self.declare_parameter('turn_point_speed', 1.35)
+        self.declare_parameter('turn_point_rotate_speed_rad', 0.50)
+        self.declare_parameter('turn_point_rotate_speed', 0.50)
+        self.declare_parameter('turn_point_timeout_s', 8.0)
+        self.declare_parameter('turn_point_timeout', 8.0)
+        self.declare_parameter('turn_point_rotate_timeout_s', 4.0)
+        self.declare_parameter('bottom_backup_timeout_s', 4.0)
+        self.declare_parameter('bottom_backup_timeout', 4.0)
+        self.declare_parameter('bottom_backup_speed_mps', 0.85)
+        self.declare_parameter('bottom_backup_speed', 0.85)
+        self.declare_parameter('bottom_recovery_timeout', 2.5)
+        # Phase 2A: Safe Lost-Target Deceleration and Recovery Governance
+        self.declare_parameter('lost_target_decel_mps2', 1.80)
+        self.declare_parameter('enable_turn_point_recovery', False)
         self.declare_parameter('kp_y_boost', 0.0050)
         self.declare_parameter('kp_lateral', 0.0035)
-        self.declare_parameter('deadband_x', 25.0)
-        self.declare_parameter('deadband_y', 30.0)
-        self.declare_parameter('max_forward_speed', 1.80)
-        self.declare_parameter('min_forward_speed', -1.50)
-        self.declare_parameter('tree_clearance_margin', 1.8)
+
         self.declare_parameter('teleop_timeout', 0.5)
         self.declare_parameter('goto_altitude', 3.8)
-        # Brief reverse recovery when a target leaves through the lower edge.
-        # Turning immediately can point the camera away from a person who is
-        # still directly ahead and only needs a little separation.
-        self.declare_parameter('bottom_backup_timeout', 1.4)
-        self.declare_parameter('bottom_recovery_timeout', 2.5)
-        # When a target disappears laterally, briefly follow the last known
-        # ground-relative vector before rotating.  This restores the old
-        # turn-point behavior with bounded speed and duration.
-        self.declare_parameter('turn_point_timeout', 3.2)
-        self.declare_parameter('turn_point_speed', 1.15)
         self.declare_parameter('target_area_min', 6000.0)
         self.declare_parameter('target_area_max', 13000.0)
         self.declare_parameter('kp_area', 0.00015)
@@ -154,6 +185,21 @@ class MotionArbiter(Node):
         )
 
         gp = self.get_parameter
+        def get_p(primary, alias, default):
+            try:
+                p_val = gp(primary).value
+                if p_val is not None and p_val != default:
+                    return p_val
+            except Exception:
+                pass
+            try:
+                a_val = gp(alias).value
+                if a_val is not None:
+                    return a_val
+            except Exception:
+                pass
+            return default
+
         self.mavlink_uri = gp('mavlink').value
         self.auto_takeoff = bool(gp('auto_takeoff').value)
         self.auto_track = bool(gp('auto_track').value)
@@ -164,22 +210,56 @@ class MotionArbiter(Node):
         self.search_rate = abs(float(gp('search_rate').value))
         self.lost_timeout = float(gp('lost_timeout').value)
         self.vision_fresh_timeout = max(0.10, float(gp('vision_fresh_timeout').value))
-        self.enable_forward = bool(gp('enable_forward').value)
-        self.default_walk_speed = float(gp('default_walk_speed').value)
-        self.default_backup_speed = float(gp('default_backup_speed').value)
+        self.enable_forward = True
         self.kp_y_boost = float(gp('kp_y_boost').value)
         self.kp_lateral = float(gp('kp_lateral').value)
-        self.deadband_x = float(gp('deadband_x').value)
-        self.deadband_y = float(gp('deadband_y').value)
+
+        # 3D Pinhole Distance & Camera Parameters
+        self.camera_pitch_rad = float(gp('camera_pitch_rad').value)
+        self.fx = float(gp('fx').value)
+        self.fy = float(gp('fy').value)
+        self.cx = float(gp('cx').value)
+        self.cy = float(gp('cy').value)
+        self.person_height_m = float(gp('person_height_m').value)
+        self.min_relative_height_m = float(gp('min_relative_height_m').value)
+        self.target_distance_m = float(gp('target_distance_m').value)
+        self.tree_clearance_margin = float(get_p('tree_clearance_margin_m', 'tree_clearance_margin', 1.80))
+
+        # Restored Control & Speed Parameters (cb6b1ae defaults)
+        self.default_walk_speed = float(get_p('base_forward_speed_mps', 'default_walk_speed', 0.85))
+        self.default_backup_speed = float(get_p('backward_speed_mps', 'default_backup_speed', 0.75))
+        self.deadband_x = float(get_p('deadband_x_px', 'deadband_x', 20.0))
+        self.deadband_y = float(get_p('deadband_y_px', 'deadband_y', 25.0))
         self.max_forward_speed = float(gp('max_forward_speed').value)
         self.min_forward_speed = float(gp('min_forward_speed').value)
-        self.tree_clearance_margin = float(gp('tree_clearance_margin').value)
+
+        # Turn-Point & Recovery
+        self.turn_point_speed = float(get_p('turn_point_speed_mps', 'turn_point_speed', 1.35))
+        self.turn_point_rotate_speed = float(get_p('turn_point_rotate_speed_rad', 'turn_point_rotate_speed', 0.50))
+        self.turn_point_timeout = float(get_p('turn_point_timeout_s', 'turn_point_timeout', 8.0))
+        self.turn_point_rotate_timeout = float(gp('turn_point_rotate_timeout_s').value)
+        self.bottom_backup_timeout = float(get_p('bottom_backup_timeout_s', 'bottom_backup_timeout', 4.0))
+        self.bottom_backup_speed = float(get_p('bottom_backup_speed_mps', 'bottom_backup_speed', 0.85))
+        self.bottom_recovery_timeout = float(gp('bottom_recovery_timeout').value)
+        # Phase 2A: Safe Lost-Target Deceleration and Recovery Governance
+        self.lost_target_decel_mps2 = float(get_p('lost_target_decel_mps2', 'lost_target_decel_mps2', 1.80))
+        self.enable_turn_point_recovery = bool(get_p('enable_turn_point_recovery', 'enable_turn_point_recovery', False))
+        self.in_turn_point_maneuver = False
+
+        self.camera_config = PinholeCameraConfig(
+            camera_pitch_rad=self.camera_pitch_rad,
+            fx=self.fx,
+            fy=self.fy,
+            cx=self.cx,
+            cy=self.cy,
+            person_height_m=self.person_height_m,
+            min_relative_height_m=self.min_relative_height_m,
+            target_distance_m=self.target_distance_m,
+            tree_clearance_margin_m=self.tree_clearance_margin,
+        )
+
         self.teleop_timeout = float(gp('teleop_timeout').value)
         self.goto_altitude = float(gp('goto_altitude').value)
-        self.bottom_backup_timeout = float(gp('bottom_backup_timeout').value)
-        self.bottom_recovery_timeout = float(gp('bottom_recovery_timeout').value)
-        self.turn_point_timeout = max(0.5, float(gp('turn_point_timeout').value))
-        self.turn_point_speed = max(0.0, float(gp('turn_point_speed').value))
         self.target_area_min = float(gp('target_area_min').value)
         self.target_area_max = float(gp('target_area_max').value)
         self.kp_area = float(gp('kp_area').value)
@@ -192,6 +272,14 @@ class MotionArbiter(Node):
         self.max_z_speed = max(0.2, float(gp('max_z_speed').value))
         self.small_box_max_speed = max(0.05, float(gp('small_box_max_speed').value))
         self._distance_mode = 'neutral'
+
+        # Decoupled Target Geometry & Distance Estimation outputs
+        self.latest_geometry = TargetGeometry()
+        self.distance_dx: float = 0.0
+        self.distance_dy: float = 0.0
+        self.ground_distance: float = 0.0
+        self.distance_valid: bool = False
+        self.distance_confidence: float = 0.0
 
         # State Machine (Default: STANDBY - waits for user click/key before tracking)
         self.current_state = STATE_STANDBY
@@ -242,6 +330,8 @@ class MotionArbiter(Node):
         self.vision_ready: bool = False
         self.last_vision_time: Optional[float] = None
         self.valid_vision_messages: int = 0
+        self.last_perception_status_time: Optional[float] = None
+        self.perception_status_messages: int = 0
 
         # Teleop variables
         self.teleop_vx: float = 0.0
@@ -316,11 +406,15 @@ class MotionArbiter(Node):
         self.create_subscription(Point, '/tracking/error', self.on_tracking_error, 10)
         self.create_subscription(Twist, '/teleop/cmd_vel', self.on_teleop_cmd, 10)
         self.create_subscription(Int32, '/tracking/select_target', self.on_target_selected, 10)
+        self.create_subscription(
+            String, '/tracking/target_handle', self.on_target_handle, 10)
         self.create_subscription(String, '/teleop/flight_action', self.on_flight_action, 10)
         self.create_subscription(Point, '/tracking/goto_gps', self.on_goto_gps, 10)
         self.pub_state = self.create_publisher(String, '/tracking/motion_state', 10)
         self.pub_gps = self.create_publisher(NavSatFix, '/tracking/gps', 10)
         self.pub_health = self.create_publisher(String, '/tracking/control_health', 10)
+        self.pub_geometry = self.create_publisher(String, '/tracking/target_geometry', 10)
+        self.pub_ground_dist = self.create_publisher(Point, '/tracking/ground_distance', 10)
 
         # Establish single MAVLink connection to PX4
         self.master = None
@@ -459,6 +553,15 @@ class MotionArbiter(Node):
         with self.rx_lock:
             entry = self.rx_latest.get(mtype)
         return (time.time() - entry[0]) if entry is not None else float('inf')
+
+    def _get_ros_time_seconds(self) -> float:
+        """Return current ROS 2 clock time in seconds, or time.time() if clock is not initialized."""
+        try:
+            if hasattr(self, '_clock') and self._clock is not None:
+                return float(self.get_clock().now().nanoseconds / 1e9)
+        except Exception:
+            pass
+        return float(time.time())
 
     def get_current_altitude(self) -> float:
         """Return the best available real-time altitude above takeoff ground level.
@@ -627,38 +730,44 @@ class MotionArbiter(Node):
             return
 
         if getattr(self, 'wait_for_vision_before_takeoff', True):
-            self.get_logger().info('[AUTO-TAKEOFF] [WAITING_FOR_VISION] Waiting for valid, fresh perception stream (/tracking/error)...')
+            readiness_topic = (
+                '/tracking/error' if self.auto_track
+                else '/tracking/target_handle'
+            )
+            self.get_logger().info(
+                '[AUTO-TAKEOFF] [WAITING_FOR_VISION] Waiting for fresh '
+                f'perception stream ({readiness_topic})...'
+            )
             t_vis = time.time()
             while time.time() - t_vis < 25.0:
                 with self.lock:
-                    is_ready = (
-                        self.vision_ready
-                        and self.last_vision_time is not None
-                        and (time.time() - self.last_vision_time) <= self.vision_fresh_timeout
-                        and self.valid_vision_messages >= 1
-                    )
+                    is_ready = self._perception_ready_locked()
                 if is_ready:
                     break
                 time.sleep(0.2)
 
             with self.lock:
-                is_ready = (
-                    self.vision_ready
-                    and self.last_vision_time is not None
-                    and (time.time() - self.last_vision_time) <= self.vision_fresh_timeout
-                    and self.valid_vision_messages >= 1
-                )
+                is_ready = self._perception_ready_locked()
             if not is_ready:
                 self.get_logger().error(
                     f'[AUTO-TAKEOFF] [DO NOT TAKEOFF] Perception stream not ready within 25s '
-                    f'(msgs={self.valid_vision_messages}, ready={self.vision_ready}); refusing auto-takeoff.'
+                    f'(tracking_msgs={self.valid_vision_messages}, '
+                    f'status_msgs={self.perception_status_messages}, '
+                    f'auto_track={self.auto_track}); refusing auto-takeoff.'
                 )
                 self.is_taking_off = False
                 return
 
+            if self.auto_track:
+                ready_messages = self.valid_vision_messages
+                ready_age = time.time() - self.last_vision_time
+            else:
+                ready_messages = self.perception_status_messages
+                ready_age = time.time() - self.last_perception_status_time
             self.get_logger().info(
                 f'[AUTO-TAKEOFF] [VISION_READY] Perception stream verified '
-                f'(msgs={self.valid_vision_messages}, age={time.time() - self.last_vision_time:.3f}s).'
+                f'(source={readiness_topic}, msgs={ready_messages}, '
+                f'age={ready_age:.3f}s).'
             )
             self.get_logger().info('[AUTO-TAKEOFF] [AUTO_TAKEOFF_ALLOWED] Proceeding with auto-takeoff sequence.')
             time.sleep(2.0)
@@ -937,7 +1046,7 @@ class MotionArbiter(Node):
         """Handle incoming manual flight teleop commands."""
         received_mono = time.monotonic()
         received_wall = time.time()
-        received_ros = self.get_clock().now().nanoseconds / 1e9
+        received_ros = self._get_ros_time_seconds()
         state_before = self.current_state
         with self.lock:
             self.teleop_vx = float(msg.linear.x)
@@ -945,7 +1054,7 @@ class MotionArbiter(Node):
             self.teleop_vz = float(msg.linear.z)
             self.teleop_yaw_rate = float(msg.angular.z)
             self.last_teleop_cmd_time = received_wall
-            self._teleop_generation += 1
+            self._teleop_generation = getattr(self, '_teleop_generation', 0) + 1
             generation = self._teleop_generation
 
             is_active_move = (
@@ -1006,13 +1115,9 @@ class MotionArbiter(Node):
             self.active_target_id = int(msg.data) if int(msg.data) >= 0 else None
             return
 
-        now = time.time()
-        if self.current_state == STATE_MANUAL and (now - self.last_teleop_cmd_time) <= self.teleop_timeout:
-            self.get_logger().info('[TARGET] Suppressing target selection while MANUAL teleop is active.')
-            return
-
         target_id = int(msg.data)
         if target_id >= 0:
+            self.last_teleop_cmd_time = 0.0
             self.set_state(STATE_TRACKING, trigger='click_or_key_lock', target_id=target_id)
         else:
             self.set_state(STATE_STANDBY, trigger='key_standby', target_id=None)
@@ -1073,25 +1178,69 @@ class MotionArbiter(Node):
 
             # 3D Pinhole & Tree Clearance Geometry (real-time altitude & pitch compensation)
             current_h = self.get_current_altitude()
-            h_rel = max(0.5, current_h - 0.90)
-            alpha_y = math.atan2(self.error_y, 178.07)
-            alpha_x = math.atan2(self.error_x, 133.55)
-            # Camera is physically angled ~0.65 rad down. Pitch > 0 tilts nose up (reducing depression angle).
             pitch_rad = getattr(self, 'current_pitch', 0.0)
-            theta_dep = max(0.15, min(1.45, 0.65 - pitch_rad + alpha_y))
+            geom = estimate_pinhole_geometry(
+                error_x=self.error_x,
+                error_y=self.error_y,
+                current_altitude=current_h,
+                vehicle_pitch=pitch_rad,
+                config=getattr(self, 'camera_config', None),
+                target_id=int(self.active_target_id if self.active_target_id is not None else -1)
+            )
+            self.latest_geometry = geom
+            self.distance_dx = geom.distance_dx
+            self.distance_dy = geom.distance_dy
+            self.ground_distance = geom.ground_distance
+            self.distance_valid = geom.distance_valid
+            self.distance_confidence = geom.distance_confidence
 
-            dx = h_rel / math.tan(theta_dep)
-            dy = dx * math.tan(alpha_x)
-            target_dx = dx + self.tree_clearance_margin
-            total_dist = math.sqrt(target_dx * target_dx + dy * dy)
-
-            self.target_dx = max(2.0, min(16.0, target_dx))
-            self.target_dy = max(-8.0, min(8.0, dy))
-            self.target_dist = max(2.5, min(16.0, total_dist))
+            self.target_dx = geom.target_dx
+            self.target_dy = geom.target_dy
+            self.target_dist = geom.target_dist
             self.dist_advanced = 0.0
 
             if getattr(self, 'auto_track', False) and self.is_airborne and self.current_state == STATE_STANDBY:
                 self.set_state(STATE_TRACKING, trigger='auto_track_first_detection', target_id=0)
+
+        # Publish target geometry and ground distance telemetry
+        if getattr(self, 'pub_geometry', None) is not None:
+            g_msg = String()
+            g_msg.data = json.dumps(asdict(self.latest_geometry))
+            self.pub_geometry.publish(g_msg)
+        if getattr(self, 'pub_ground_dist', None) is not None:
+            pt = Point()
+            pt.x = float(self.distance_dx)
+            pt.y = float(self.distance_dy)
+            pt.z = float(self.ground_distance)
+            self.pub_ground_dist.publish(pt)
+
+    def on_target_handle(self, msg: String):
+        """Record a detector heartbeat without treating NO_TARGET as an error."""
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict) or 'state' not in payload:
+            return
+        with self.lock:
+            self.last_perception_status_time = time.time()
+            self.perception_status_messages += 1
+
+    def _perception_ready_locked(self) -> bool:
+        """Check the readiness source appropriate to the target-selection mode."""
+        now = time.time()
+        if self.auto_track:
+            return (
+                self.vision_ready
+                and self.last_vision_time is not None
+                and now - self.last_vision_time <= self.vision_fresh_timeout
+                and self.valid_vision_messages >= 1
+            )
+        return (
+            self.last_perception_status_time is not None
+            and now - self.last_perception_status_time <= self.vision_fresh_timeout
+            and self.perception_status_messages >= 1
+        )
 
     # ------------------------------------------------------------------
     # 10 Hz Control Dispatch Loop
@@ -1108,7 +1257,8 @@ class MotionArbiter(Node):
         self.last_tick_monotonic = monotonic_now
         self.control_tick_count = getattr(self, 'control_tick_count', 0) + 1
         tick_id = self.control_tick_count
-        expected_mono = last_mono + self.control_period_s
+        control_period = getattr(self, 'control_period_s', 0.10)
+        expected_mono = last_mono + control_period
         tick_thread_id = threading.get_native_id()
         self.max_control_period_s = max(getattr(self, 'max_control_period_s', 0.0), raw_dt)
         self._write_scheduler_trace({
@@ -1121,8 +1271,8 @@ class MotionArbiter(Node):
             'late_by_ms': (monotonic_now - expected_mono) * 1000.0,
             'pid': os.getpid(),
             'thread_id': tick_thread_id,
-            'ros_time': self.get_clock().now().nanoseconds / 1e9,
-            'clock_type': str(getattr(self.control_clock, 'clock_type', 'STEADY_TIME')),
+            'ros_time': self._get_ros_time_seconds(),
+            'clock_type': str(getattr(getattr(self, 'control_clock', None), 'clock_type', 'STEADY_TIME')),
             'schedstat': self._read_schedstat(tick_thread_id),
         })
         control_warn = getattr(self, 'control_warn_period_s', 0.20)
@@ -1166,7 +1316,14 @@ class MotionArbiter(Node):
                     self.set_state(STATE_STANDBY, trigger='vehicle_disarm_detected', target_id=None)
                     state = self.current_state
 
-            effective_lost_timeout = self.lost_timeout
+            effective_lost_timeout = getattr(self, 'lost_timeout', 4.0)
+            if getattr(self, 'enable_turn_point_recovery', False) and getattr(self, 'in_turn_point_maneuver', False):
+                tp_timeout = (
+                    getattr(self, 'turn_point_timeout', 2.5) +
+                    getattr(self, 'turn_point_rotate_timeout', 1.8) +
+                    1.0
+                )
+                effective_lost_timeout = max(effective_lost_timeout, tp_timeout)
             if state == STATE_TRACKING and self.acquired_once and age > effective_lost_timeout:
                 self.get_logger().info(
                     f'[TRACKING] Target lost for {age:.1f}s (> {effective_lost_timeout}s) -> Returning to STANDBY hover.'
@@ -1175,7 +1332,7 @@ class MotionArbiter(Node):
                 state = self.current_state
 
             if state == STATE_MANUAL:
-                trace = self._teleop_trace
+                trace = getattr(self, '_teleop_trace', None)
                 if (now - self.last_teleop_cmd_time) <= self.teleop_timeout:
                     final_vx = self.teleop_vx
                     final_vy = self.teleop_vy
@@ -1225,7 +1382,7 @@ class MotionArbiter(Node):
                 'wall_time': time.time(),
                 'monotonic_time': teleop_decision_trace['received_mono'],
                 'decision_mono': decision_mono,
-                'ros_time': self.get_clock().now().nanoseconds / 1e9,
+                'ros_time': self._get_ros_time_seconds(),
                 'vx': final_vx,
                 'vy': final_vy,
                 'vz': final_vz,
@@ -1254,7 +1411,7 @@ class MotionArbiter(Node):
                     'wall_time': now,
                     'monotonic_time': teleop_decision_trace['received_mono'],
                     'mavlink_send_mono': send_mono,
-                    'ros_time': self.get_clock().now().nanoseconds / 1e9,
+                    'ros_time': self._get_ros_time_seconds(),
                     'vx': final_vx,
                     'vy': final_vy,
                     'vz': final_vz,
@@ -1449,103 +1606,60 @@ class MotionArbiter(Node):
         if vision_fresh:
             self.dist_advanced = 0.0
 
-            # Bounding box size (distance) evaluation
-            is_box_small = (self.area is not None and self.area > 50.0 and self.area < self.target_area_min)
-            is_box_large = (self.area is not None and self.area > self.target_area_max)
-            # Use a small release hysteresis on box size so noisy detections
-            # do not alternate between advancing and backing every frame.
-            large_area_release = self.target_area_max * 0.90
-            if self._distance_mode == 'approaching':
-                area_large_for_control = (
-                    self.area is not None and self.area > large_area_release
-                )
-            else:
-                area_large_for_control = is_box_large
-            is_approaching = (error_y > self.deadband_y or area_large_for_control)
-            if is_approaching:
-                self._distance_mode = 'approaching'
-            elif error_y < -self.deadband_y or is_box_small:
-                self._distance_mode = 'advancing'
-            else:
-                self._distance_mode = 'neutral'
-
+            # Safe Zone Deadband Check (RESTORED cb6b1ae behavior)
             in_safe_zone = (
                 abs(error_x) <= self.deadband_x
                 and abs(error_y) <= self.deadband_y
-                and not is_box_small
-                and not area_large_for_control
             )
 
             if in_safe_zone:
+                # Inside safe zone: hover calm and stable, no jitter or oscillation
                 vx = 0.0
                 vy = 0.0
                 yaw_rate = 0.0
                 substate = 'SAFE_ZONE_HOVER'
             else:
-                # 1. Yaw tracking: keep target centered horizontally
+                # 1. Lateral & Yaw tracking: keep target centered horizontally
                 if abs(error_x) > self.deadband_x:
                     excess_x = error_x - (self.deadband_x if error_x > 0 else -self.deadband_x)
                     yaw_rate = self.kp * excess_x
                     vy = self.kp_lateral * excess_x
-                    vy = max(-0.35, min(0.35, vy))
+                    vy = max(-0.40, min(0.40, vy))
                 else:
                     yaw_rate = 0.0
                     vy = 0.0
 
-                # 2. Distance regulation: Decide between BACKING UP vs ADVANCING
+                # 2. Forward / Backward Velocity (cb6b1ae control law)
                 if self.enable_forward:
-                    if is_approaching:
-                        # SCENARIO A: Target is walking towards drone / getting close -> BACK UP
-                        # Smooth proportional reverse without abrupt step jump to prevent pitch jerk
-                        if error_y > self.deadband_y:
-                            boost = self.kp_y_boost * (error_y - self.deadband_y)
-                        else:
-                            boost = self.kp_area * (self.area - self.target_area_max)
-                        vx = -min(self.default_backup_speed + 0.25, 0.15 + boost)
-                        substate = 'BACKING_SMOOTH'
-                        # Retain responsive yaw and lateral tracking so camera stays locked on target
-                        yaw_rate = max(-self.max_rate, min(self.max_rate, yaw_rate))
-                        vy = max(-0.35, min(0.35, vy))
-
-                    elif error_y < -self.deadband_y:
-                        # SCENARIO B: Target is moving forward / high in frame -> ADVANCE
-                        boost = self.kp_y_boost * (-error_y - self.deadband_y)
+                    if error_y < -self.deadband_y:
+                        # Target in upper frame (farther away) -> Advance to track
+                        excess_y = -error_y - self.deadband_y
+                        boost = self.kp_y_boost * excess_y
                         vx = self.default_walk_speed + boost
                         substate = 'ADVANCING'
-                        # Only reduce forward speed when target makes a sharp turn (> 60px off center)
-                        if abs(error_x) > 60.0:
-                            scale = max(0.20, 1.0 - (abs(error_x) - 60.0) / 60.0)
-                            vx *= scale
 
-                    elif is_box_small:
-                        # SCENARIO C: Target is small in frame (too far away) -> CLOSE IN
-                        area_deficit = self.target_area_min - (self.area if self.area is not None else 0.0)
-                        boost = self.kp_area * max(0.0, area_deficit)
-                        # Closing distance is deliberately slower than normal
-                        # pursuit; a centered target may be turning and needs
-                        # room for the controller to stop.
-                        vx = min(self.small_box_max_speed, self.default_walk_speed + boost)
-                        substate = 'ADVANCING_CLOSE_IN'
-                        if abs(error_x) > 60.0:
-                            scale = max(0.20, 1.0 - (abs(error_x) - 60.0) / 60.0)
-                            vx *= scale
+                        # Deceleration taper when approaching deadband margin
+                        if excess_y < 50.0:
+                            taper = max(0.40, min(1.0, excess_y / 50.0))
+                            vx *= taper
+
+                    elif error_y > self.deadband_y:
+                        # Target in lower frame (too close) -> Back away smoothly
+                        excess_y = error_y - self.deadband_y
+                        boost = self.kp_y_boost * excess_y
+                        vx = -(self.default_backup_speed + boost)
+                        substate = 'BACKING_SMOOTH'
+
                     else:
                         vx = 0.0
                         substate = 'LATERAL_YAW_ONLY'
                 else:
                     vx = 0.0
 
-                # Taper pursuit speed as the target approaches the vertical
-                # center.  Without this, the controller held nearly full
-                # speed until the deadband and then had too much momentum to
-                # stop before the person turned or left the frame.
-                if vx > 0.0:
-                    if error_y < -self.deadband_y:
-                        center_margin = max(0.0, -error_y - self.deadband_y)
-                        speed_scale = max(0.25, min(1.0, center_margin / 80.0))
-                        vx *= speed_scale
-                    elif is_box_small:
-                        vx = min(vx, self.small_box_max_speed)
+                # Scale down forward speed when target makes a sharp lateral turn (> 60px off center)
+                if abs(error_x) > 60.0 and vx > 0.0:
+                    scale = max(0.30, 1.0 - (abs(error_x) - 60.0) / 80.0)
+                    vx *= scale
 
                 vx = max(self.min_forward_speed, min(self.max_forward_speed, vx))
 
@@ -1554,36 +1668,45 @@ class MotionArbiter(Node):
             vx, vy, yaw_rate = 0.0, 0.0, 0.0
         else:
             # Target was lost from view:
-            # If target exited via the bottom of the frame (walked past underneath),
-            # smoothly reverse with decayed lateral velocity and gentle yaw heading recovery
-            # rather than locking controls to zero or backing up blindly.
+            # Pattern A: Target walked under drone / left via bottom of frame (last_seen_y > deadband_y)
             if self.last_seen_y > self.deadband_y and age <= self.bottom_backup_timeout:
                 substate = 'BACKING_UP_TO_RECOVER'
-                taper = max(0.20, 1.0 - (age / self.bottom_backup_timeout))
-                vx = -min(0.45, self.default_backup_speed) * taper
-                vy = self._last_vy * 0.85
-                yaw_rate = self.target_turn_dir * min(self.search_rate, 0.50) * (1.0 - 0.3 * taper)
-            elif (self.last_seen_y <= self.deadband_y
+                # Back up straight to reopen field of view; STRICTLY yaw_rate = 0.0 (NO 360 spin!)
+                vx = -abs(self.bottom_backup_speed)
+                vy = 0.0
+                yaw_rate = 0.0
+
+            # Pattern B: Legacy Turn-Point Corner Recovery (Only when explicitly authorized AND in active turn maneuver)
+            elif (getattr(self, 'enable_turn_point_recovery', False)
+                  and getattr(self, 'in_turn_point_maneuver', False)
+                  and self.last_seen_y <= self.deadband_y
                   and self.dist_advanced < target_dist
                   and age <= self.turn_point_timeout):
-                # Lateral loss: follow the last known target vector toward the
-                # likely turn point, then rotate in place.  The speed cap and
-                # timeout prevent this fallback from becoming blind pursuit.
+                # Stage 1: Fly straight along 3D vector to turn point with tree clearance margin
                 substate = 'ADVANCING_TO_TURN_POINT'
                 speed = min(self.turn_point_speed, self.max_forward_speed)
                 if target_dist > 1e-3:
                     vx = speed * (target_dx / target_dist)
                     vy = speed * (target_dy / target_dist)
                 self.dist_advanced += speed * dt
-                yaw_rate = 0.0
-            elif age <= self.lost_timeout:
-                # Target turned off-screen laterally: rotate towards turn direction to scan
-                substate = 'RECOVERING_YAW_HEADING'
+                yaw_rate = 0.0  # Fly straight without turning
+
+            elif (getattr(self, 'enable_turn_point_recovery', False)
+                  and getattr(self, 'in_turn_point_maneuver', False)
+                  and self.last_seen_y <= self.deadband_y
+                  and age <= (self.turn_point_timeout + self.turn_point_rotate_timeout)):
+                # Stage 2: Arrived at turn point -> rotate towards turn direction to acquire person
+                substate = 'ROTATING_AT_TURN_POINT'
                 vx = 0.0
                 vy = 0.0
-                yaw_rate = self.target_turn_dir * self.search_rate
+                yaw_rate = self.target_turn_dir * self.turn_point_rotate_speed
+
             else:
-                substate = 'SEARCHING_HOLD'
+                # Stage 3 / Generic Target Loss: Safe Controlled Deceleration to Station Hold
+                if abs(self._last_vx) > 0.05 or abs(self._last_vy) > 0.05:
+                    substate = 'DECELERATING_TO_HOLD'
+                else:
+                    substate = 'SEARCHING_HOLD'
                 vx = 0.0
                 vy = 0.0
                 yaw_rate = 0.0
@@ -1592,23 +1715,28 @@ class MotionArbiter(Node):
 
         # Slew rate limiters: gentle acceleration on XY to prevent pitch-induced altitude bobbing,
         # smooth yaw acceleration to prevent sudden jerking
+        decel_rate = getattr(self, 'lost_target_decel_mps2', 1.80)
         accel_x = 1.5
-        brake_x = 2.4
+        brake_x = decel_rate if substate == 'DECELERATING_TO_HOLD' else 2.4
         reducing_x = (
             abs(vx) < abs(self._last_vx)
             or (vx * self._last_vx < 0.0)
         )
         max_delta_x = (brake_x if reducing_x else accel_x) * dt
         vx = max(self._last_vx - max_delta_x, min(self._last_vx + max_delta_x, vx))
+        if substate in ('DECELERATING_TO_HOLD', 'SEARCHING_HOLD') and abs(vx) < 0.02:
+            vx = 0.0
 
         accel_y = 1.5
-        brake_y = 2.4
+        brake_y = decel_rate if substate == 'DECELERATING_TO_HOLD' else 2.4
         reducing_y = (
             abs(vy) < abs(self._last_vy)
             or (vy * self._last_vy < 0.0)
         )
         max_delta_y = (brake_y if reducing_y else accel_y) * dt
         vy = max(self._last_vy - max_delta_y, min(self._last_vy + max_delta_y, vy))
+        if substate in ('DECELERATING_TO_HOLD', 'SEARCHING_HOLD') and abs(vy) < 0.02:
+            vy = 0.0
 
         # Vertical slew rate limiter to prevent violent heave shocks
         accel_z = 1.5
@@ -1617,6 +1745,8 @@ class MotionArbiter(Node):
 
         max_yaw_accel = 3.5 * dt
         yaw_rate = max(self._last_yaw_rate - max_yaw_accel, min(self._last_yaw_rate + max_yaw_accel, yaw_rate))
+        if substate in ('DECELERATING_TO_HOLD', 'SEARCHING_HOLD') and abs(yaw_rate) < 0.01:
+            yaw_rate = 0.0
 
         if substate != self.last_tracking_substate or (substate.startswith('BACKING') and abs(vx - self._last_vx) > 0.15):
             self.get_logger().info(

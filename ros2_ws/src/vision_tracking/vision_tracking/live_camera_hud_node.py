@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 import cv2
 import rclpy
 from rclpy.node import Node
@@ -25,6 +26,7 @@ from sensor_msgs.msg import Image, NavSatFix
 from geometry_msgs.msg import Point, Twist
 from std_msgs.msg import Int32, String
 from cv_bridge import CvBridge
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 
 class LiveCameraHUD(Node):
@@ -36,6 +38,7 @@ class LiveCameraHUD(Node):
         self.declare_parameter('teleop_z_speed', 1.0)
         self.declare_parameter('teleop_yaw_speed', 1.10)
         self.declare_parameter('map_radius_m', 25.0)
+        self.declare_parameter('display_fps', 30.0)
 
         if topic_name is None:
             resolved_topic = self.get_parameter('topic').get_parameter_value().string_value
@@ -46,6 +49,10 @@ class LiveCameraHUD(Node):
         self.teleop_z_speed = self.get_parameter('teleop_z_speed').get_parameter_value().double_value
         self.teleop_yaw_speed = self.get_parameter('teleop_yaw_speed').get_parameter_value().double_value
         self.map_radius_m = self.get_parameter('map_radius_m').get_parameter_value().double_value
+        self.display_fps = max(
+            1.0,
+            self.get_parameter('display_fps').get_parameter_value().double_value,
+        )
 
         self.bridge = CvBridge()
         self.fps = 0.0
@@ -55,6 +62,17 @@ class LiveCameraHUD(Node):
         self.last_frame_h = 480
         self.last_window_w = 960
         self.last_window_h = 720
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_seq = 0
+        self._displayed_frame_seq = 0
+        self._display_stop = threading.Event()
+        self._display_thread = None
+        self._display_timer = None
+        self._image_callback_count = 0
+        self._display_count = 0
+        self._last_display_diag = 0.0
+        self._display_exception_count = 0
 
         # Minimap assumption: a fixed 25 m radius around the first valid GPS
         # fix (home). North is up and east is right. This keeps the HUD useful
@@ -94,12 +112,13 @@ class LiveCameraHUD(Node):
         # Subscriptions
         self.create_subscription(String, '/tracking/motion_state', self.on_motion_state, 10)
         self.create_subscription(NavSatFix, '/tracking/gps', self.on_gps, 10)
-        self.subscription = self.create_subscription(
-            Image,
-            resolved_topic,
-            self.image_callback,
-            1  # Lowest latency
+        debug_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
         )
+        self.subscription = self.create_subscription(
+            Image, resolved_topic, self.image_callback, debug_qos)
 
         self.window_name = "Live Drone Camera POV (Direct Stream)"
         self.gui_available = True
@@ -110,6 +129,15 @@ class LiveCameraHUD(Node):
         except cv2.error as e:
             self.gui_available = False
             self.get_logger().warn(f"OpenCV GUI not initialized (headless/no display): {e}")
+
+        if self.gui_available:
+            # OpenCV's Qt backend is not thread-safe: namedWindow/imshow and
+            # waitKey must run on the same (ROS executor) thread that created
+            # the window.  The previous daemon display thread could therefore
+            # leave a live but black WSLg window.  Keep frame delivery
+            # asynchronous, but schedule GUI work through a ROS timer.
+            self._display_timer = self.create_timer(
+                1.0 / self.display_fps, self._display_tick)
 
         self.get_logger().info(
             f"LiveCameraHUD ready on {resolved_topic}. Controls: [TAB/T]=Takeoff(4m), [P]=Land, "
@@ -177,6 +205,10 @@ class LiveCameraHUD(Node):
 
     def on_mouse(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
+            try:
+                _wx, _wy, self.last_window_w, self.last_window_h = cv2.getWindowImageRect(self.window_name)
+            except cv2.error:
+                pass
             # WINDOW_NORMAL preserves aspect ratio, so account for letterbox
             # margins before translating the click into frame coordinates.
             display_scale = min(
@@ -274,8 +306,48 @@ class LiveCameraHUD(Node):
             return
 
         ih, iw = frame.shape[:2]
-        self.last_frame_w = iw
-        self.last_frame_h = ih
+        # Keep the ROS callback lightweight. The display thread owns all
+        # OpenCV drawing/window calls and always consumes the newest frame.
+        with self._frame_lock:
+            self.last_frame_w = iw
+            self.last_frame_h = ih
+            self._latest_frame = frame
+            self._latest_frame_seq += 1
+            self._image_callback_count += 1
+
+    def _display_tick(self):
+        if self._display_stop.is_set():
+            return
+        with self._frame_lock:
+            if (self._latest_frame is None
+                    or self._latest_frame_seq == self._displayed_frame_seq):
+                frame = None
+            else:
+                frame = self._latest_frame.copy()
+                self._displayed_frame_seq = self._latest_frame_seq
+        if frame is None:
+            return
+        try:
+            self._render_frame(frame)
+            self._display_count += 1
+        except Exception as exc:  # noqa: BLE001
+            self._display_exception_count += 1
+            self.get_logger().error(
+                f'HUD display callback failed ({self._display_exception_count}): '
+                f'{exc}\n{traceback.format_exc()}'
+            )
+        now = time.monotonic()
+        if now - self._last_display_diag >= 5.0:
+            self._last_display_diag = now
+            self.get_logger().info(
+                f'[HUD] callbacks={self._image_callback_count} '
+                f'displayed={self._display_count} gui_timer_active='
+                f'{self._display_timer is not None} '
+                f'exceptions={self._display_exception_count}'
+            )
+
+    def _render_frame(self, frame):
+        ih, iw = frame.shape[:2]
 
         self.frame_count += 1
         now = time.time()
@@ -343,10 +415,6 @@ class LiveCameraHUD(Node):
 
         try:
             cv2.imshow(self.window_name, frame)
-            try:
-                _wx, _wy, self.last_window_w, self.last_window_h = cv2.getWindowImageRect(self.window_name)
-            except cv2.error:
-                pass
             key = cv2.waitKey(1) & 0xFF
         except cv2.error:
             key = 255
@@ -429,6 +497,11 @@ class LiveCameraHUD(Node):
                 f"Vy={twist.linear.y:+.1f}, Vz={twist.linear.z:+.1f}, Yaw={twist.angular.z:+.1f})"
             )
 
+    def stop_display(self):
+        self._display_stop.set()
+        if self._display_timer is not None:
+            self._display_timer.cancel()
+
 
 def main(args=None):
     parser = argparse.ArgumentParser(description='Live Camera HUD Node')
@@ -447,6 +520,7 @@ def main(args=None):
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        hud.stop_display()
         try:
             cv2.destroyAllWindows()
         except cv2.error:

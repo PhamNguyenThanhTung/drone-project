@@ -20,7 +20,8 @@ yolo_detector_node:
     bottom_margin_ratio: 0.0
     show_debug_image: true
     target_timeout: 4.0
-    lock_reacquire_s: 5.0
+    lock_reacquire_s: 3.5
     reacquire_min_iou: 0.15
+    auto_track: false
     log_period: 1.5
     max_frame_rate: 0.0

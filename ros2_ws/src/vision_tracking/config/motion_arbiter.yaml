@@ -9,21 +9,52 @@ motion_arbiter:
     lost_timeout: 5.0
     vision_fresh_timeout: 0.40
     enable_forward: true
-    default_walk_speed: 1.15
-    default_backup_speed: 1.10
+
+    # 3D Pinhole Geometry & Camera Calibration (cb6b1ae port)
+    camera_pitch_rad: 0.65
+    fx: 133.55
+    fy: 178.07
+    cx: 208.0
+    cy: 208.0
+    person_height_m: 0.90
+    min_relative_height_m: 1.50
+    target_distance_m: 4.50
+    tree_clearance_margin_m: 1.80
+
+    # Restored cb6b1ae Speed & Safe-Zone Deadband Parameters
+    base_forward_speed_mps: 0.85
+    default_walk_speed: 0.85
+    backward_speed_mps: 0.75
+    default_backup_speed: 0.75
+    deadband_x_px: 20.0
+    deadband_x: 20.0
+    deadband_y_px: 25.0
+    deadband_y: 25.0
     kp_y_boost: 0.0050
     kp_lateral: 0.0035
-    deadband_x: 25.0
-    deadband_y: 30.0
     max_forward_speed: 1.80
-    min_forward_speed: -1.50
-    tree_clearance_margin: 1.8
+    min_forward_speed: -1.20
+
+    # Restored Turn-Point & Recovery Parameters
+    turn_point_speed_mps: 1.35
+    turn_point_speed: 1.35
+    turn_point_rotate_speed_rad: 0.50
+    turn_point_rotate_speed: 0.50
+    turn_point_timeout_s: 8.0
+    turn_point_timeout: 8.0
+    turn_point_rotate_timeout_s: 4.0
+    bottom_backup_timeout_s: 4.0
+    bottom_backup_timeout: 4.0
+    bottom_backup_speed_mps: 0.85
+    bottom_backup_speed: 0.85
+    bottom_recovery_timeout: 2.5
+    # Phase 2A: Safe Lost-Target Deceleration and Recovery Governance
+    lost_target_decel_mps2: 1.80
+    enable_turn_point_recovery: false
+
+    # General & Offboard Watchdog
     teleop_timeout: 0.5
     goto_altitude: 3.8
-    bottom_backup_timeout: 1.4
-    bottom_recovery_timeout: 2.5
-    turn_point_timeout: 3.2
-    turn_point_speed: 1.15
     target_area_min: 6000.0
     target_area_max: 13000.0
     kp_area: 0.00015
