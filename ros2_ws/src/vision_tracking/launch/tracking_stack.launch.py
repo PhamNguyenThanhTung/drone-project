@@ -32,15 +32,18 @@ def launch_setup(context, *args, **kwargs):
 
     nodes_to_launch = []
 
-    # 1. ros_gz_bridge: Bridge camera image from Gazebo transport to ROS 2 Image
+    # 1. ros_gz_bridge: Specialized image bridge from Gazebo transport to ROS 2 Image
     if use_bridge:
         nodes_to_launch.append(
             Node(
-                package='ros_gz_bridge',
-                executable='parameter_bridge',
+                package='ros_gz_image',
+                executable='image_bridge',
                 name='ros_gz_bridge',
                 output='screen',
-                arguments=['/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image'],
+                arguments=['/camera/image_raw'],
+                parameters=[{
+                    'use_sim_time': False,
+                }],
             )
         )
 

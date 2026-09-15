@@ -20,6 +20,7 @@ yolo_detector_node:
     bottom_margin_ratio: 0.0
     show_debug_image: false
     overlay_topic: "/tracking/overlay"
+    relay_topic: "/tracking/camera_relay"
     target_timeout: 4.0
     lock_reacquire_s: 3.5
     reacquire_min_iou: 0.15

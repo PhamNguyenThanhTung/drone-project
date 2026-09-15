@@ -84,6 +84,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('bottom_margin_ratio', 0.0)
         self.declare_parameter('show_debug_image', False)
         self.declare_parameter('overlay_topic', '/tracking/overlay')
+        self.declare_parameter('relay_topic', '/tracking/camera_relay')
         self.declare_parameter('target_timeout', 4.0)
         # ByteTrack hands out a fresh track id whenever a person is missed for
         # a few frames (very common at CPU frame rates). Without re-binding,
@@ -98,6 +99,7 @@ class YoloDetectorNode(Node):
         gp = self.get_parameter
         self.image_topic = gp('image_topic').value
         self.overlay_topic = gp('overlay_topic').value
+        self.relay_topic = gp('relay_topic').value
         self.W = int(gp('img_width').value)
         self.H = int(gp('img_height').value)
         self.infer_native = bool(gp('infer_native').value)
@@ -141,6 +143,14 @@ class YoloDetectorNode(Node):
         self.pub_select = self.create_publisher(Int32, '/tracking/select_target', 10)
         self.pub_target_handle = self.create_publisher(String, '/tracking/target_handle', 10)
         self.pub_overlay = self.create_publisher(String, self.overlay_topic, 10)
+        self.pub_relay = None
+        if self.relay_topic:
+            relay_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.pub_relay = self.create_publisher(Image, self.relay_topic, relay_qos)
         self.pub_debug = None
         if self.show_debug_image:
             debug_qos = QoSProfile(
@@ -231,7 +241,9 @@ class YoloDetectorNode(Node):
     # Step 3: Lightweight ROS image callback + worker thread
     # ------------------------------------------------------------------
     def on_image(self, msg):
-        """Non-blocking callback: cache newest image and wake up worker."""
+        """Non-blocking callback: relay camera stream and wake up worker."""
+        if self.pub_relay is not None:
+            self.pub_relay.publish(msg)
         with self._frame_lock:
             self._latest_image_msg = msg
         self._new_frame_event.set()
@@ -263,6 +275,8 @@ class YoloDetectorNode(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error('cv_bridge conversion failed: %s' % exc)
             return
+        if frame is None:
+            return
 
         src_h, src_w = frame.shape[:2]
         if self.logged_source_size != (src_w, src_h):
@@ -287,9 +301,6 @@ class YoloDetectorNode(Node):
         self.sy = self.H / float(ih)
         imgsz = self.infer_imgsz if self.infer_imgsz > 0 else max(iw, ih)
 
-        # Half-precision FP16 on CUDA GPUs (RTX 4060: ~1.3-1.6x speedup)
-        is_cuda = isinstance(self.device, str) and self.device.lower().startswith('cuda')
-
         t0 = time.time()
         results = self.model.track(
             infer,
@@ -300,7 +311,6 @@ class YoloDetectorNode(Node):
             iou=self.iou,
             device=self.device,
             imgsz=imgsz,
-            half=is_cuda,
             verbose=False,
         )
         latency = time.time() - t0

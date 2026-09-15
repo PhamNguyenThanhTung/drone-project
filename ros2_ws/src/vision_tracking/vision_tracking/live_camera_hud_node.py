@@ -33,7 +33,7 @@ class LiveCameraHUD(Node):
     def __init__(self, topic_name=None):
         super().__init__('live_camera_hud')
 
-        self.declare_parameter('topic', '/camera/image_raw')
+        self.declare_parameter('topic', '/tracking/camera_relay')
         self.declare_parameter('overlay_topic', '/tracking/overlay')
         self.declare_parameter('teleop_speed', 2.0)
         self.declare_parameter('teleop_z_speed', 1.0)
