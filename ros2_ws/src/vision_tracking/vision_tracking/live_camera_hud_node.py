@@ -326,6 +326,10 @@ class LiveCameraHUD(Node):
                 frame = self._latest_frame.copy()
                 self._displayed_frame_seq = self._latest_frame_seq
         if frame is None:
+            try:
+                self._handle_key(cv2.waitKey(1) & 0xFF)
+            except cv2.error:
+                pass
             return
         try:
             self._render_frame(frame)
@@ -418,6 +422,12 @@ class LiveCameraHUD(Node):
             key = cv2.waitKey(1) & 0xFF
         except cv2.error:
             key = 255
+
+        self._handle_key(key)
+
+    def _handle_key(self, key):
+        if key == 255 or key < 0:
+            return
 
         # -------------------------------------------------------------
         # KEY HANDLERS: TAB / T (Takeoff), P (Land), Numbers (Lock), Flight Keys
