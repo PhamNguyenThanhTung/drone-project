@@ -1,6 +1,7 @@
 live_camera_hud:
   ros__parameters:
-    topic: "/tracking/debug_image"
+    topic: "/camera/image_raw"
+    overlay_topic: "/tracking/overlay"
     teleop_speed: 2.0
     teleop_z_speed: 1.0
     teleop_yaw_speed: 1.10

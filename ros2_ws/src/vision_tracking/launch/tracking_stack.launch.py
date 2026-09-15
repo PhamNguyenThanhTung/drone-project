@@ -99,13 +99,20 @@ def launch_setup(context, *args, **kwargs):
 
     # 5. live_camera_hud_node: Named 'live_camera_hud' to match tracking_stack.yaml
     if show_hud:
+        hud_params = [params_file]
+        hud_overrides = {}
+        if use_realism:
+            hud_overrides['topic'] = '/simulation/camera/image'
+        if hud_overrides:
+            hud_params.append(hud_overrides)
+
         nodes_to_launch.append(
             Node(
                 package='vision_tracking',
                 executable='live_camera_hud_node',
                 name='live_camera_hud',
                 output='screen',
-                parameters=[params_file],
+                parameters=hud_params,
             )
         )
 

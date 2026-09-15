@@ -18,7 +18,8 @@ yolo_detector_node:
     min_aspect_ratio: 0.70
     max_aspect_ratio: 4.80
     bottom_margin_ratio: 0.0
-    show_debug_image: true
+    show_debug_image: false
+    overlay_topic: "/tracking/overlay"
     target_timeout: 4.0
     lock_reacquire_s: 3.5
     reacquire_min_iou: 0.15

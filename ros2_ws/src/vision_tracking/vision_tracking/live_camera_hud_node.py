@@ -33,7 +33,8 @@ class LiveCameraHUD(Node):
     def __init__(self, topic_name=None):
         super().__init__('live_camera_hud')
 
-        self.declare_parameter('topic', '/tracking/debug_image')
+        self.declare_parameter('topic', '/camera/image_raw')
+        self.declare_parameter('overlay_topic', '/tracking/overlay')
         self.declare_parameter('teleop_speed', 2.0)
         self.declare_parameter('teleop_z_speed', 1.0)
         self.declare_parameter('teleop_yaw_speed', 1.10)
@@ -44,6 +45,9 @@ class LiveCameraHUD(Node):
             resolved_topic = self.get_parameter('topic').get_parameter_value().string_value
         else:
             resolved_topic = topic_name
+        self.topic = resolved_topic
+        self.overlay_topic = self.get_parameter('overlay_topic').get_parameter_value().string_value
+        self.is_debug_image_topic = (resolved_topic == '/tracking/debug_image')
 
         self.teleop_speed = self.get_parameter('teleop_speed').get_parameter_value().double_value
         self.teleop_z_speed = self.get_parameter('teleop_z_speed').get_parameter_value().double_value
@@ -73,6 +77,10 @@ class LiveCameraHUD(Node):
         self._display_count = 0
         self._last_display_diag = 0.0
         self._display_exception_count = 0
+
+        # Step 2: Overlay metadata storage
+        self._overlay_lock = threading.Lock()
+        self._latest_overlay = None
 
         # Minimap assumption: a fixed 25 m radius around the first valid GPS
         # fix (home). North is up and east is right. This keeps the HUD useful
@@ -112,6 +120,8 @@ class LiveCameraHUD(Node):
         # Subscriptions
         self.create_subscription(String, '/tracking/motion_state', self.on_motion_state, 10)
         self.create_subscription(NavSatFix, '/tracking/gps', self.on_gps, 10)
+        self.sub_overlay = self.create_subscription(
+            String, self.overlay_topic, self.on_overlay, 10)
         debug_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -203,6 +213,14 @@ class LiveCameraHUD(Node):
         except Exception:
             pass
 
+    def on_overlay(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            with self._overlay_lock:
+                self._latest_overlay = data
+        except Exception:
+            pass
+
     def on_mouse(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             try:
@@ -233,12 +251,22 @@ class LiveCameraHUD(Node):
                         self._publish_goto(*gps)
                     return
 
+            with self._overlay_lock:
+                overlay = self._latest_overlay
+            if overlay is not None:
+                src_w = float(overlay.get('source_w', self.last_frame_w))
+                src_h = float(overlay.get('source_h', self.last_frame_h))
+                click_x = fx * (src_w / max(1.0, float(self.last_frame_w)))
+                click_y = fy * (src_h / max(1.0, float(self.last_frame_h)))
+            else:
+                click_x, click_y = fx, fy
+
             msg = Point()
-            msg.x = fx
-            msg.y = fy
+            msg.x = click_x
+            msg.y = click_y
             msg.z = 0.0
             self.pub_click.publish(msg)
-            self.get_logger().info(f"[HUD Click] Clicked at ({fx:.0f}, {fy:.0f}) -> requesting target lock")
+            self.get_logger().info(f"[HUD Click] Clicked at ({click_x:.0f}, {click_y:.0f}) -> requesting target lock")
 
     def draw_minimap_and_gps(self, frame):
         """Draw the home-centered minimap plus the live GPS readout under it."""
@@ -350,6 +378,123 @@ class LiveCameraHUD(Node):
                 f'exceptions={self._display_exception_count}'
             )
 
+    def draw_overlay(self, frame):
+        """Draw detection bounding boxes and status badge onto raw camera frame."""
+        with self._overlay_lock:
+            overlay = self._latest_overlay
+        if overlay is None:
+            return
+
+        ih, iw = frame.shape[:2]
+
+        # Draw 50% active tracking safe zone box
+        zx1, zx2 = int(0.25 * iw), int(0.75 * iw)
+        zy1, zy2 = int(0.25 * ih), int(0.75 * ih)
+        z_color = (0, 255, 255)
+        bracket_len = 25
+        cv2.line(frame, (zx1, zy1), (zx1 + bracket_len, zy1), z_color, 1)
+        cv2.line(frame, (zx1, zy1), (zx1, zy1 + bracket_len), z_color, 1)
+        cv2.line(frame, (zx2, zy1), (zx2 - bracket_len, zy1), z_color, 1)
+        cv2.line(frame, (zx2, zy1), (zx2, zy1 + bracket_len), z_color, 1)
+        cv2.line(frame, (zx1, zy2), (zx1 + bracket_len, zy2), z_color, 1)
+        cv2.line(frame, (zx1, zy2), (zx1, zy2 - bracket_len), z_color, 1)
+        cv2.line(frame, (zx2, zy2), (zx2 - bracket_len, zy2), z_color, 1)
+        cv2.line(frame, (zx2, zy2), (zx2, zy2 - bracket_len), z_color, 1)
+        cv2.putText(
+            frame, "50% SAFE ZONE", (zx1 + 5, zy1 + 14),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # Check overlay staleness (e.g. if >2.5s without detection update)
+        overlay_stamp = overlay.get('stamp', 0.0)
+        is_stale = (time.time() - overlay_stamp > 2.5) if overlay_stamp > 0 else False
+
+        src_w = float(overlay.get('source_w', iw))
+        src_h = float(overlay.get('source_h', ih))
+        scale_x = iw / max(src_w, 1.0)
+        scale_y = ih / max(src_h, 1.0)
+
+        if not is_stale:
+            # 1. Other persons (clickable, thin grey)
+            for p in overlay.get('other_persons', []):
+                bx = p.get('box', [])
+                if len(bx) == 4:
+                    x1 = int(bx[0] * scale_x)
+                    y1 = int(bx[1] * scale_y)
+                    x2 = int(bx[2] * scale_x)
+                    y2 = int(bx[3] * scale_y)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (150, 150, 150), 1)
+                    cv2.putText(
+                        frame, "person (click)", (x1 + 3, max(12, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1, cv2.LINE_AA)
+
+            # 2. Tracked candidates
+            handle_id = overlay.get('handle_id')
+            for cand in overlay.get('cands', []):
+                bx = cand.get('box', [])
+                if len(bx) != 4:
+                    continue
+                x1 = int(bx[0] * scale_x)
+                y1 = int(bx[1] * scale_y)
+                x2 = int(bx[2] * scale_x)
+                y2 = int(bx[3] * scale_y)
+                is_target = cand.get('is_target', False)
+                color = (0, 255, 0) if is_target else (255, 180, 0)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_target else 2)
+
+                if is_target and handle_id:
+                    lock_mark = f" [{handle_id} LOCK]"
+                elif is_target:
+                    lock_mark = " [LOCK]"
+                else:
+                    lock_mark = ""
+                label = "PERSON%s" % lock_mark
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                label_y = max(th + 4, y1)
+                cv2.rectangle(frame, (x1, label_y - th - 4), (x1 + tw + 6, label_y + 2), color, -1)
+                cv2.putText(
+                    frame, label, (x1 + 3, label_y - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # 3. Status banner
+        state = overlay.get('state')
+        handle_id = overlay.get('handle_id')
+        lock_mode = overlay.get('lock_mode', 'MANUAL')
+
+        if is_stale:
+            status_text = "DETECTOR STALE / SEARCHING..."
+            badge_color = (0, 140, 255)
+        elif state == 'TRACKING':
+            lock_label = handle_id if (handle_id and lock_mode == 'MANUAL') else 'AUTO'
+            status_text = f"TRACKING [{lock_label}]"
+            badge_color = (0, 200, 0)
+        elif state == 'UNCERTAIN':
+            handle_str = f" [{handle_id}]" if handle_id else ""
+            status_text = f"TARGET UNCERTAIN{handle_str} - HOLDING"
+            badge_color = (0, 165, 255)
+        elif state == 'TARGET_LOST':
+            handle_str = f" [{handle_id}]" if handle_id else ""
+            status_text = f"TARGET LOST{handle_str}"
+            badge_color = (0, 0, 255)
+        elif state in ('TARGET_SELECTED', 'TARGET_LOCKED'):
+            handle_str = f" [{handle_id}]" if handle_id else ""
+            status_text = f"TARGET LOCKED{handle_str}"
+            badge_color = (255, 255, 0)
+        elif overlay.get('cands') or overlay.get('other_persons'):
+            status_text = "CLICK A PERSON TO LOCK"
+            badge_color = (0, 200, 255)
+        else:
+            status_text = "SEARCHING PERSON..."
+            badge_color = (0, 140, 255)
+
+        (sw, sh), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        bx = int(iw * 0.33)
+        cv2.rectangle(frame, (bx, 10), (bx + sw + 10, 20 + sh + 6), (30, 30, 30), -1)
+        cv2.rectangle(frame, (bx, 10), (bx + sw + 10, 20 + sh + 6), badge_color, 2)
+        cv2.putText(
+            frame, status_text, (bx + 5, 16 + sh),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, badge_color, 1, cv2.LINE_AA)
+
     def _render_frame(self, frame):
         ih, iw = frame.shape[:2]
 
@@ -375,6 +520,10 @@ class LiveCameraHUD(Node):
             1,
             cv2.LINE_AA
         )
+
+        # Step 2: Overlay boxes from detector metadata if consuming raw camera stream
+        if not self.is_debug_image_topic:
+            self.draw_overlay(frame)
 
         # Game-style minimap + GPS readout (own method so it can be rendered
         # and inspected headlessly, without an X display or a live PX4).

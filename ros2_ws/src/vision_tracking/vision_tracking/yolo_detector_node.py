@@ -11,7 +11,9 @@ Pipeline:
 """
 
 import json
+import threading
 import time
+import traceback
 import cv2
 import torch
 import rclpy
@@ -80,7 +82,8 @@ class YoloDetectorNode(Node):
         self.declare_parameter('min_aspect_ratio', 0.70)
         self.declare_parameter('max_aspect_ratio', 4.80)
         self.declare_parameter('bottom_margin_ratio', 0.0)
-        self.declare_parameter('show_debug_image', True)
+        self.declare_parameter('show_debug_image', False)
+        self.declare_parameter('overlay_topic', '/tracking/overlay')
         self.declare_parameter('target_timeout', 4.0)
         # ByteTrack hands out a fresh track id whenever a person is missed for
         # a few frames (very common at CPU frame rates). Without re-binding,
@@ -94,6 +97,7 @@ class YoloDetectorNode(Node):
 
         gp = self.get_parameter
         self.image_topic = gp('image_topic').value
+        self.overlay_topic = gp('overlay_topic').value
         self.W = int(gp('img_width').value)
         self.H = int(gp('img_height').value)
         self.infer_native = bool(gp('infer_native').value)
@@ -136,6 +140,7 @@ class YoloDetectorNode(Node):
         self.pub_error = self.create_publisher(Point, gp('error_topic').value, 10)
         self.pub_select = self.create_publisher(Int32, '/tracking/select_target', 10)
         self.pub_target_handle = self.create_publisher(String, '/tracking/target_handle', 10)
+        self.pub_overlay = self.create_publisher(String, self.overlay_topic, 10)
         self.pub_debug = None
         if self.show_debug_image:
             debug_qos = QoSProfile(
@@ -199,6 +204,15 @@ class YoloDetectorNode(Node):
         self.n_lost_events = 0
         self.last_log = time.time()
 
+        # Step 3: Decouple inference from ROS executor callback with worker thread
+        self._frame_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._new_frame_event = threading.Event()
+        self._latest_image_msg = None
+        self._stop_worker = threading.Event()
+        self._worker_thread = threading.Thread(target=self._inference_worker, daemon=True, name="yolo-worker")
+        self._worker_thread.start()
+
         self.get_logger().info(
             'yolo_detector_node ready: image_topic=%s error_frame=%dx%d '
             'infer_native=%s tracker=%s device=%s conf=%.2f'
@@ -206,7 +220,39 @@ class YoloDetectorNode(Node):
                self.tracker, self.device, self.conf))
 
     # ------------------------------------------------------------------
+    def destroy_node(self):
+        self._stop_worker.set()
+        self._new_frame_event.set()
+        if hasattr(self, '_worker_thread') and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
+        super().destroy_node()
+
+    # ------------------------------------------------------------------
+    # Step 3: Lightweight ROS image callback + worker thread
+    # ------------------------------------------------------------------
     def on_image(self, msg):
+        """Non-blocking callback: cache newest image and wake up worker."""
+        with self._frame_lock:
+            self._latest_image_msg = msg
+        self._new_frame_event.set()
+
+    def _inference_worker(self):
+        """Dedicated background thread running YOLOv8 tracking without blocking ROS executor."""
+        while not self._stop_worker.is_set():
+            if not self._new_frame_event.wait(timeout=0.05):
+                continue
+            self._new_frame_event.clear()
+            with self._frame_lock:
+                msg = self._latest_image_msg
+                self._latest_image_msg = None
+            if msg is None:
+                continue
+            try:
+                self._process_image(msg)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f'[YOLO] Worker exception: {exc}\n{traceback.format_exc()}')
+
+    def _process_image(self, msg):
         now = time.monotonic()
         if (self.max_frame_rate > 0.0 and self.last_inference_monotonic > 0.0
                 and now - self.last_inference_monotonic < 1.0 / self.max_frame_rate):
@@ -241,6 +287,9 @@ class YoloDetectorNode(Node):
         self.sy = self.H / float(ih)
         imgsz = self.infer_imgsz if self.infer_imgsz > 0 else max(iw, ih)
 
+        # Half-precision FP16 on CUDA GPUs (RTX 4060: ~1.3-1.6x speedup)
+        is_cuda = isinstance(self.device, str) and self.device.lower().startswith('cuda')
+
         t0 = time.time()
         results = self.model.track(
             infer,
@@ -251,122 +300,172 @@ class YoloDetectorNode(Node):
             iou=self.iou,
             device=self.device,
             imgsz=imgsz,
+            half=is_cuda,
             verbose=False,
         )
         latency = time.time() - t0
 
-        self.n_frames += 1
-        self.sum_latency += latency
-        self.max_latency = max(self.max_latency, latency)
-
-        # 1. Parse & filter detected persons
+        # 1. Parse & filter detected persons (single GPU->CPU copy inside)
         cands = self.extract_candidates(results, infer)
-        self.current_cands = cands
 
-        # 2. Target State Manager update (Fail-closed governance)
-        now_t = time.time()
-        is_manual = (getattr(self, 'arbiter_motion_state', None) == 'MANUAL')
+        # 2. Target State Manager update & publishing under state lock
+        with self._state_lock:
+            self.n_frames += 1
+            self.sum_latency += latency
+            self.max_latency = max(self.max_latency, latency)
+            self.current_cands = cands
 
-        if self.manual_target_id == -1:
-            matched_cand = None
-            current_state = STATE_NO_TARGET
-        else:
-            matched_cand, current_state = self.target_manager.update(
-                cands=cands,
-                all_persons=self.all_persons,
-                now=now_t,
-                is_manual_flight=is_manual
-            )
+            now_t = time.time()
+            is_manual = (getattr(self, 'arbiter_motion_state', None) == 'MANUAL')
 
-        self.state = current_state
-        handle = self.target_manager.target_handle
-
-        if matched_cand is not None and handle is not None and handle.is_tracking():
-            self.n_detected += 1
-            self.last_seen = now_t
-
-            # Check if tracker track_id was remapped under the same logical handle
-            if handle.current_track_id != self.manual_target_id and handle.current_track_id is not None:
-                old_tid = self.manual_target_id
-                self.manual_target_id = handle.current_track_id
-                self.n_id_remaps += 1
-                self.get_logger().info(
-                    f'[YOLO] Target {handle.handle_id} track remapped: {old_tid} -> {self.manual_target_id}'
+            if self.manual_target_id == -1:
+                matched_cand = None
+                current_state = STATE_NO_TARGET
+            else:
+                matched_cand, current_state = self.target_manager.update(
+                    cands=cands,
+                    all_persons=self.all_persons,
+                    now=now_t,
+                    is_manual_flight=is_manual
                 )
-                if not is_manual:
-                    out = Int32()
-                    out.data = int(self.manual_target_id)
-                    self.pub_select.publish(out)
 
-            self.target_id = handle.current_track_id
-            self.smooth_box = handle.smoothed_bbox
-            target_tuple = (
-                self.target_id,
-                self.smooth_box[0],
-                self.smooth_box[1],
-                self.smooth_box[2],
-                self.smooth_box[3],
-                handle.last_confidence
-            )
-            self.publish_error(target_tuple)
-        else:
-            # Target not actively tracking: FAIL-CLOSED (do NOT publish tracking error)
-            self.target_id = handle.current_track_id if handle is not None else None
-            if current_state == STATE_TARGET_LOST:
-                self.smooth_box = None
-                self.n_lost_events += 1
+            self.state = current_state
+            handle = self.target_manager.target_handle
 
-        self.publish_target_handle_telemetry()
+            if matched_cand is not None and handle is not None and handle.is_tracking():
+                self.n_detected += 1
+                self.last_seen = now_t
 
-        if self.pub_debug is not None:
-            self.publish_debug(infer, matched_cand)
+                # Check if tracker track_id was remapped under the same logical handle
+                if handle.current_track_id != self.manual_target_id and handle.current_track_id is not None:
+                    old_tid = self.manual_target_id
+                    self.manual_target_id = handle.current_track_id
+                    self.n_id_remaps += 1
+                    self.get_logger().info(
+                        f'[YOLO] Target {handle.handle_id} track remapped: {old_tid} -> {self.manual_target_id}'
+                    )
+                    if not is_manual:
+                        out = Int32()
+                        out.data = int(self.manual_target_id)
+                        self.pub_select.publish(out)
 
-        self.log_metrics()
+                self.target_id = handle.current_track_id
+                self.smooth_box = handle.smoothed_bbox
+                target_tuple = (
+                    self.target_id,
+                    self.smooth_box[0],
+                    self.smooth_box[1],
+                    self.smooth_box[2],
+                    self.smooth_box[3],
+                    handle.last_confidence
+                )
+                self.publish_error(target_tuple)
+            else:
+                # Target not actively tracking: FAIL-CLOSED (do NOT publish tracking error)
+                self.target_id = handle.current_track_id if handle is not None else None
+                if current_state == STATE_TARGET_LOST:
+                    self.smooth_box = None
+                    self.n_lost_events += 1
+
+            self.publish_target_handle_telemetry()
+            self.publish_overlay(iw, ih, matched_cand, now_t)
+
+            if self.show_debug_image and self.pub_debug is not None:
+                self.publish_debug(infer, matched_cand)
+
+            self.log_metrics()
+
+    def publish_overlay(self, iw, ih, matched_cand, now_t):
+        """Step 2: Publish lightweight JSON overlay metadata (~200 bytes) for HUD visualization."""
+        if self.pub_overlay is None:
+            return
+        handle = self.target_manager.target_handle
+        cand_ids = {c[0] for c in self.current_cands}
+
+        cands_json = []
+        for c in self.current_cands:
+            is_tgt = (matched_cand is not None and c[0] == matched_cand[0])
+            cands_json.append({
+                'id': int(c[0]),
+                'box': [round(float(v), 1) for v in c[1:5]],
+                'conf': round(float(c[5]), 2),
+                'area': round(float(c[6]), 1),
+                'is_target': is_tgt,
+            })
+
+        other_json = []
+        for p in self.all_persons:
+            if p[0] in cand_ids:
+                continue
+            other_json.append({
+                'id': int(p[0]),
+                'box': [round(float(v), 1) for v in p[1:5]],
+                'conf': round(float(p[5]), 2),
+            })
+
+        payload = {
+            'stamp': now_t,
+            'source_w': int(iw),
+            'source_h': int(ih),
+            'state': self.state,
+            'target_id': self.target_id,
+            'manual_target_id': self.manual_target_id,
+            'handle_id': handle.handle_id if handle else None,
+            'lock_mode': handle.lock_mode if handle else None,
+            'cands': cands_json,
+            'other_persons': other_json,
+        }
+
+        msg = String()
+        msg.data = json.dumps(payload, separators=(',', ':'))
+        self.pub_overlay.publish(msg)
 
     def on_select_target(self, msg):
         req_id = int(msg.data)
-        if req_id < 0:
-            self.get_logger().info('[YOLO] Target selection CLEARED -> Standby')
-            self.target_manager.clear_target(reason='operator_clear')
-            self.manual_target_id = -1
-            self.target_id = None
-            self.smooth_box = None
-            self.lock_lost_since = None
-            self.state = STATE_NO_TARGET
-            self.publish_target_handle_telemetry()
-        elif (self.target_manager.target_handle is not None
-              and req_id == self.target_manager.target_handle.current_track_id):
-            # Echo of our own re-acquire publish or already active track; keep existing lock state.
-            return
-        else:
-            self.get_logger().info(f'[YOLO] Target LOCKED to Person ID: {req_id}')
-            cand_bbox = None
-            cand_conf = 1.0
-            pool = self.all_persons or self.current_cands
-            for c in pool:
-                if c[0] == req_id:
-                    cand_bbox = c[1:5]
-                    cand_conf = float(c[5])
-                    break
-            handle = self.target_manager.select_target(
-                track_id=req_id,
-                bbox=cand_bbox,
-                conf=cand_conf,
-                lock_mode='MANUAL'
-            )
-            self.manual_target_id = req_id
-            self.target_id = req_id
-            self.lock_lost_since = None
-            self.smooth_box = cand_bbox
-            self.state = handle.state if handle else STATE_NO_TARGET
-            self.publish_target_handle_telemetry()
+        with self._state_lock:
+            if req_id < 0:
+                self.get_logger().info('[YOLO] Target selection CLEARED -> Standby')
+                self.target_manager.clear_target(reason='operator_clear')
+                self.manual_target_id = -1
+                self.target_id = None
+                self.smooth_box = None
+                self.lock_lost_since = None
+                self.state = STATE_NO_TARGET
+                self.publish_target_handle_telemetry()
+            elif (self.target_manager.target_handle is not None
+                  and req_id == self.target_manager.target_handle.current_track_id):
+                # Echo of our own re-acquire publish or already active track; keep existing lock state.
+                return
+            else:
+                self.get_logger().info(f'[YOLO] Target LOCKED to Person ID: {req_id}')
+                cand_bbox = None
+                cand_conf = 1.0
+                pool = self.all_persons or self.current_cands
+                for c in pool:
+                    if c[0] == req_id:
+                        cand_bbox = c[1:5]
+                        cand_conf = float(c[5])
+                        break
+                handle = self.target_manager.select_target(
+                    track_id=req_id,
+                    bbox=cand_bbox,
+                    conf=cand_conf,
+                    lock_mode='MANUAL'
+                )
+                self.manual_target_id = req_id
+                self.target_id = req_id
+                self.lock_lost_since = None
+                self.smooth_box = cand_bbox
+                self.state = handle.state if handle else STATE_NO_TARGET
+                self.publish_target_handle_telemetry()
 
     def on_click_point(self, msg):
         """Resolve a HUD pixel click against every detected person."""
         # Deliberately uses all_persons, not current_cands: a pilot pointing at
         # somebody on screen must be able to lock them even if the box shape
         # failed the automatic-selection filters.
-        pool = self.all_persons or self.current_cands
+        with self._state_lock:
+            pool = list(self.all_persons or self.current_cands)
         if not pool:
             self.get_logger().info('[YOLO] HUD click ignored: no person boxes available')
             return
@@ -391,16 +490,18 @@ class YoloDetectorNode(Node):
     # ------------------------------------------------------------------
     def extract_candidates(self, results, frame):
         if not results:
-            self.all_persons = []
+            with self._state_lock:
+                self.all_persons = []
             return []
         boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            self.all_persons = []
+        if boxes is None or len(boxes) == 0 or boxes.data is None or len(boxes.data) == 0:
+            with self._state_lock:
+                self.all_persons = []
             return []
 
-        ids = boxes.id.int().tolist() if boxes.id is not None else list(range(len(boxes)))
-        xyxy = boxes.xyxy.tolist()
-        confs = boxes.conf.tolist()
+        # Single GPU->CPU transfer: gộp 3 lần .tolist() thành 1 lần .cpu().numpy()
+        data = boxes.data.cpu().numpy()
+        has_id = (data.shape[1] >= 7) and (boxes.id is not None)
 
         ih, iw = frame.shape[:2]
         frame_area = float(iw * ih)
@@ -409,21 +510,22 @@ class YoloDetectorNode(Node):
         bottom_limit = ih * (1.0 - self.bottom_margin_ratio)
 
         cands = []
-        # Every class-0 detection, geometry filters NOT applied. A HUD click is
-        # an explicit human decision: if YOLO saw a person where the pilot
-        # clicked, the lock must be allowed even when the box shape would be
-        # rejected for automatic selection.
         all_persons = []
-        # The person currently being tracked also survives the shape gates: a
-        # walker who turns, leans or swings an arm briefly produces a wide or
-        # very large box, and dropping those frames was enough to break the
-        # track id and lose the lock entirely.
-        if self.manual_target_id is not None and self.manual_target_id >= 0:
-            keep_id = self.manual_target_id
-        else:
-            keep_id = self.target_id
-        for tid, box, cf in zip(ids, xyxy, confs):
-            x1, y1, x2, y2 = box
+        with self._state_lock:
+            if self.manual_target_id is not None and self.manual_target_id >= 0:
+                keep_id = self.manual_target_id
+            else:
+                keep_id = self.target_id
+
+        for idx, row in enumerate(data):
+            x1, y1, x2, y2 = row[0:4]
+            if has_id:
+                tid = int(row[4])
+                cf = float(row[5])
+            else:
+                tid = idx
+                cf = float(row[4])
+
             x1 = max(0.0, min(float(iw - 1), float(x1)))
             y1 = max(0.0, min(float(ih - 1), float(y1)))
             x2 = max(0.0, min(float(iw - 1), float(x2)))
@@ -447,13 +549,15 @@ class YoloDetectorNode(Node):
 
             cands.append(entry)
 
-        self.all_persons = all_persons
+        with self._state_lock:
+            self.all_persons = all_persons
 
         return cands
 
     def on_motion_state(self, msg: String):
         try:
-            self.arbiter_motion_state = msg.data.split(':')[0].strip()
+            with self._state_lock:
+                self.arbiter_motion_state = msg.data.split(':')[0].strip()
         except Exception:
             pass
 
